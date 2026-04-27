@@ -111,8 +111,8 @@ When configured, every task you add/edit/complete/delete is mirrored to a Notion
 2. Click **"+ New integration"**
 3. Give it a name (e.g. `Notetaker Bot`), select your workspace, leave type as **Internal**
 4. Click **Submit**
-5. On the next screen, copy the **"Internal Integration Token"** — this is your `NOTION_API_KEY`.
-   It starts with `secret_` and looks like `secret_abc123...`
+5. On the next screen, copy the **"Installation access token"** — this is your `NOTION_API_KEY`.
+   It starts with `ntn_` and looks like `ntn_abc123...`
 
 ### 5b. Create the Notion database
 
@@ -136,20 +136,10 @@ Create a new **full-page database** in Notion (not an inline/embedded one — it
 3. Copy the 32-character hex string before the `?v=` (with or without dashes, both work)
    — that is your `NOTION_DATABASE_ID`
 
-### 5d. Share the database with your integration
-
-This step is easy to miss and will cause all API calls to fail with a 404.
-
-1. Open the database in Notion
-2. Click the **`···`** menu (top-right corner)
-3. Go to **"Add connections"** (or "Connect to" depending on your Notion version)
-4. Search for and select the integration you created in step 5a
-5. Click **"Confirm"**
-
-### 5e. Add credentials to .env
+### 5d. Add credentials to .env
 
 ```
-NOTION_API_KEY=secret_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+NOTION_API_KEY=ntn_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 NOTION_DATABASE_ID=abc1def2abc1def2abc1def2abc1def2
 ```
 
