@@ -8,6 +8,7 @@
 | /edit <id> | Bot asks what to change (category, due date, title) |
 | /drop <id> | Delete a task permanently |
 | /stats | Quick counts per category |
+| /sync | Pull any Notion changes into MariaDB on demand |
 
 Assuming you clone the repository into ~/notetaker with
 ```bash
@@ -98,7 +99,68 @@ scp credentials.json token.json user@yourserver:~/notetaker/
 `token.json` refreshes itself automatically — you will not need to redo the OAuth flow
 unless you revoke access in your Google account.
 
-## 5. Deploy the bot
+## 5. Notion sync (optional)
+
+Notion sync is completely optional. If you skip this section, the bot works exactly as before — just leave `NOTION_API_KEY` and `NOTION_DATABASE_ID` blank in `.env`.
+
+When configured, every task you add/edit/complete/delete is mirrored to a Notion database in real time. You can also edit tasks directly in Notion and the changes are pulled back into MariaDB each morning (or on demand via `/sync`).
+
+### 5a. Create a Notion integration (API key)
+
+1. Go to https://www.notion.so/my-integrations
+2. Click **"+ New integration"**
+3. Give it a name (e.g. `Notetaker Bot`), select your workspace, leave type as **Internal**
+4. Click **Submit**
+5. On the next screen, copy the **"Internal Integration Token"** — this is your `NOTION_API_KEY`.
+   It starts with `secret_` and looks like `secret_abc123...`
+
+### 5b. Create the Notion database
+
+Create a new **full-page database** in Notion (not an inline/embedded one — it must be its own page so it has its own URL). Add exactly these properties with these exact names and types:
+
+| Property name | Type   | Notes |
+|---------------|--------|-------|
+| `Name`        | Title  | Built-in, already exists |
+| `Category`    | Select | Add options: `Work`, `Home`, `MCM`, `YFU`, `Personal`, `Other`, `Unknown` |
+| `Due Date`    | Date   | |
+| `Done`        | Checkbox | |
+| `Done At`     | Date   | |
+| `Task ID`     | Number | Used to link Notion pages back to MariaDB rows |
+
+### 5c. Get the database ID
+
+1. Open the database as a full page in your browser (click the title, then "Open as full page" if needed)
+2. Look at the URL — it will look like one of:
+   - `https://www.notion.so/yourworkspace/abc1def2abc1def2abc1def2abc1def2?v=...`
+   - `https://www.notion.so/abc1def2-abc1-def2-abc1-def2abc1def2?v=...`
+3. Copy the 32-character hex string before the `?v=` (with or without dashes, both work)
+   — that is your `NOTION_DATABASE_ID`
+
+### 5d. Share the database with your integration
+
+This step is easy to miss and will cause all API calls to fail with a 404.
+
+1. Open the database in Notion
+2. Click the **`···`** menu (top-right corner)
+3. Go to **"Add connections"** (or "Connect to" depending on your Notion version)
+4. Search for and select the integration you created in step 5a
+5. Click **"Confirm"**
+
+### 5e. Add credentials to .env
+
+```
+NOTION_API_KEY=secret_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+NOTION_DATABASE_ID=abc1def2abc1def2abc1def2abc1def2
+```
+
+### How the sync works
+
+- **MariaDB → Notion (real-time):** every time you add, edit, complete, or delete a task via Telegram, the change is pushed to Notion immediately.
+- **Notion → MariaDB (daily + on-demand):** each morning the scheduler pulls any changes made directly in Notion and applies them to MariaDB. Use `/sync` in Telegram to trigger this manually at any time.
+- **New pages in Notion:** if you create a row directly in the Notion database (without a Task ID), it will be imported as a new task in MariaDB on the next sync.
+- **Conflict resolution:** if a Notion page was edited more recently than the last sync watermark, Notion wins. Otherwise the MariaDB value is kept.
+
+## 6. Deploy the bot
 
 ```bash
 cd ~/notetaker
@@ -112,7 +174,7 @@ chmod 600 .env
 nano .env   # fill in all values
 ```
 
-## 6. Test manually
+## 7. Test manually
 
 ```bash
 cd ~/notetaker
@@ -132,7 +194,7 @@ python scheduler.py
 You should receive the summary in Telegram. If the calendar block shows an error,
 double-check that `credentials.json` and `token.json` are in `~/notetaker/`.
 
-## 7. Set up cron jobs
+## 8. Set up cron jobs
 
 The bot runs via two cron entries: one that keeps it alive (checks every 5 minutes),
 and one that fires the daily summary at 08:00.
@@ -149,7 +211,7 @@ Add these two lines, replacing `YOUR_LINUX_USER` with your actual username:
 0 8 * * * set -a; source /home/YOUR_LINUX_USER/notetaker/.env; set +a; /home/YOUR_LINUX_USER/notetaker/venv/bin/python /home/YOUR_LINUX_USER/notetaker/scheduler.py >> /home/konstip/notetaker/logs/notetaker_cron.log 2>&1
 ```
 
-## 8. Verify everything works
+## 9. Verify everything works
 
 ```bash
 # Check bot is running
@@ -166,7 +228,7 @@ Then in Telegram:
 4. Send `/stats` → category counts
 5. Run `python ~/notetaker/scheduler.py` manually → summary arrives with calendar block
 
-## 9. Keeping it running after reboots
+## 10. Keeping it running after reboots
 
 The `*/5 * * * *` cron entry handles restarts automatically — if the server reboots,
 the bot will be back within 5 minutes with no action needed on your part.
