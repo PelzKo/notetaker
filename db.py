@@ -29,8 +29,16 @@ def init_db():
                     due_date DATE NULL,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     done_at DATETIME NULL,
-                    is_done BOOLEAN DEFAULT FALSE
+                    is_done BOOLEAN DEFAULT FALSE,
+                    notion_page_id VARCHAR(36) NULL DEFAULT NULL,
+                    notion_synced_at DATETIME NULL DEFAULT NULL
                 ) CHARACTER SET utf8mb4
+            """)
+            # Migrate existing installations that don't have the Notion columns yet
+            cur.execute("""
+                ALTER TABLE tasks
+                    ADD COLUMN IF NOT EXISTS notion_page_id VARCHAR(36) NULL DEFAULT NULL,
+                    ADD COLUMN IF NOT EXISTS notion_synced_at DATETIME NULL DEFAULT NULL
             """)
 
 
@@ -124,6 +132,27 @@ def update_task(task_id: int, **fields) -> bool:
                 (*updates.values(), task_id),
             )
             return cur.rowcount > 0
+
+
+def set_notion_page_id(task_id: int, page_id: str, synced_at: datetime | None = None) -> None:
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE tasks SET notion_page_id = %s, notion_synced_at = %s WHERE id = %s",
+                (page_id, synced_at, task_id),
+            )
+
+
+def get_tasks_without_notion_page() -> list[dict]:
+    """Return open tasks that have no linked Notion page yet."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT * FROM tasks
+                WHERE notion_page_id IS NULL
+                ORDER BY created_at ASC
+            """)
+            return cur.fetchall()
 
 
 def get_stats() -> list[dict]:
