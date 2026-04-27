@@ -10,6 +10,7 @@ import config
 import db
 import claude_client
 import google_calendar
+import notion
 from formatting import CATEGORY_EMOJI, fmt_date, fmt_task_line, build_task_list
 
 
@@ -71,8 +72,19 @@ def build_done_prompt(tasks: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _run_notion_sync() -> None:
+    """Pull Notion changes into MariaDB and notify if anything changed."""
+    if not notion.enabled():
+        return
+    changes = notion.sync_from_notion()
+    if changes:
+        lines = ["🔄 Synced from Notion:"] + [f"• {c}" for c in changes]
+        send_message("\n".join(lines))
+
+
 def main():
     db.init_db()
+    _run_notion_sync()
     summary, tasks = build_summary()
     send_message(summary)
 
