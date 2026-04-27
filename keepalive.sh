@@ -2,7 +2,7 @@
 set -euo pipefail
 
 LOCK=/home/konstip/notetaker/.bot.lock
-LOG=/home/konstip/notetaker/logs/todobot.log
+LOG=/home/konstip/notetaker/logs/notetaker.log
 
 # flock prevents double-launch race condition
 exec 9>"$LOCK"
