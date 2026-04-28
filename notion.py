@@ -11,6 +11,11 @@ log = logging.getLogger(__name__)
 _BASE = "https://api.notion.com/v1"
 _NOTION_VERSION = "2022-06-28"
 
+# Cached database schema property names (populated lazily on first use).
+# Used so we can degrade gracefully when optional properties (Priority,
+# Attachment) aren't present in the user's Notion database.
+_DB_PROPERTIES_CACHE: set[str] | None = None
+
 
 def _headers() -> dict:
     return {
@@ -22,6 +27,31 @@ def _headers() -> dict:
 
 def enabled() -> bool:
     return bool(getattr(config, "NOTION_API_KEY", "") and getattr(config, "NOTION_DATABASE_ID", ""))
+
+
+def _get_db_properties() -> set[str]:
+    """Return the set of property names defined on the configured Notion DB.
+    Cached after first successful fetch; on failure returns an empty set
+    (which causes optional properties to be silently skipped)."""
+    global _DB_PROPERTIES_CACHE
+    if _DB_PROPERTIES_CACHE is not None:
+        return _DB_PROPERTIES_CACHE
+    if not enabled():
+        _DB_PROPERTIES_CACHE = set()
+        return _DB_PROPERTIES_CACHE
+    try:
+        r = httpx.get(
+            f"{_BASE}/databases/{config.NOTION_DATABASE_ID}",
+            headers=_headers(),
+            timeout=10,
+        )
+        r.raise_for_status()
+        props = r.json().get("properties", {})
+        _DB_PROPERTIES_CACHE = set(props.keys())
+    except Exception as exc:
+        log.warning("Notion _get_db_properties failed: %s", exc)
+        _DB_PROPERTIES_CACHE = set()
+    return _DB_PROPERTIES_CACHE
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +94,12 @@ def _task_to_properties(task: dict) -> dict:
     done_at = _date_str(task.get("done_at"))
     props["Done At"] = {"date": {"start": done_at} if done_at else None}
 
+    schema = _get_db_properties()
+    if "Priority" in schema:
+        props["Priority"] = {"checkbox": bool(task.get("is_priority", False))}
+    if "Attachment" in schema:
+        props["Attachment"] = {"checkbox": int(task.get("attachment_count") or 0) > 0}
+
     return props
 
 
@@ -102,6 +138,7 @@ def _extract_page(page: dict) -> dict:
         "category": select("Category"),
         "due_date": date_prop("Due Date"),
         "is_done": checkbox("Done"),
+        "is_priority": checkbox("Priority"),
     }
 
 
@@ -217,6 +254,9 @@ def sync_from_notion() -> list[str]:
     # Import here to avoid circular imports at module level
     import db  # noqa: PLC0415
 
+    schema = _get_db_properties()
+    has_priority = "Priority" in schema
+
     pages = _query_all_pages()
     changes: list[str] = []
 
@@ -240,7 +280,8 @@ def sync_from_notion() -> list[str]:
                     due_date = date.fromisoformat(due_str[:10])
                 except ValueError:
                     pass
-            new_id = db.add_task(title, title, category, due_date)
+            is_priority = bool(info.get("is_priority")) if has_priority else False
+            new_id = db.add_task(title, title, category, due_date, is_priority=is_priority)
             db.set_notion_page_id(new_id, notion_page_id, last_edited)
             # Write the Task ID back to Notion so we link them permanently
             task = db.get_task(new_id)
@@ -282,6 +323,11 @@ def sync_from_notion() -> list[str]:
                 pass
         if new_due != task.get("due_date"):
             updates["due_date"] = new_due
+
+        if has_priority:
+            new_prio = bool(info.get("is_priority"))
+            if new_prio != bool(task.get("is_priority")):
+                updates["is_priority"] = new_prio
 
         if updates:
             db.update_task(task_id, **updates)

@@ -22,11 +22,13 @@ Categories:
 - Unknown: truly ambiguous
 
 Return ONLY valid JSON, no markdown, no explanation. Only return the string and do not surround it with quotes or the description "json":
-{"title": "...", "category": "...", "due_date": "YYYY-MM-DD or null"}
+{"title": "...", "category": "...", "due_date": "YYYY-MM-DD or null", "is_priority": true|false}
 
 Title should be imperative and concise (max 80 chars).
 For due dates: interpret relative dates using today as {today}.
-If no date is mentioned, return null."""
+If no date is mentioned, return null.
+Set is_priority to true when the text contains explicit urgency signals such as "urgent",
+"important", "asap", "high priority", "wichtig", "dringend", "eilig", "sofort", "!". Default false."""
 
 SUMMARY_SYSTEM = """You are a helpful personal assistant giving a brief, direct priority recommendation.
 You will receive a list of tasks grouped as overdue, due soon, and long-pending.
@@ -64,10 +66,18 @@ def parse_task(raw_text: str) -> dict:
                 date.fromisoformat(due)
             except ValueError:
                 parsed["due_date"] = None
+        # Coerce priority to a strict bool
+        parsed["is_priority"] = bool(parsed.get("is_priority", False))
         return parsed
     except Exception as e:
         # Graceful fallback — save with raw text as title
-        return {"title": raw_text[:80], "category": "Unknown", "due_date": None, "error": str(e)}
+        return {
+            "title": raw_text[:80],
+            "category": "Unknown",
+            "due_date": None,
+            "is_priority": False,
+            "error": str(e),
+        }
 
 
 def generate_summary_comment(tasks: dict, cal_events: dict = None) -> str:

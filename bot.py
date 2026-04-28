@@ -1,7 +1,15 @@
+import asyncio
 import logging
-from datetime import date
+from datetime import date, datetime, timedelta
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -15,13 +23,22 @@ import config
 import db
 import claude_client
 import notion
-from formatting import CATEGORY_EMOJI, fmt_date, fmt_task_line, build_task_list
+from formatting import (
+    CATEGORY_EMOJI,
+    build_task_list,
+    build_task_list_simple,
+    fmt_date,
+    fmt_task_detail,
+    fmt_task_line,
+)
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s — %(message)s",
     level=logging.INFO,
 )
 log = logging.getLogger(__name__)
+
+EDIT_FIELDS = {"title", "category", "date", "due", "priority"}
 
 # ---------------------------------------------------------------------------
 # Auth guard — only respond to your own chat
@@ -66,6 +83,80 @@ def _edit_button(task_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def _category_picker_markup(task_id: int) -> InlineKeyboardMarkup:
+    cats = [c for c in config.CATEGORIES if c != "Unknown"]
+    rows: list[list[InlineKeyboardButton]] = []
+    for i in range(0, len(cats), 4):
+        rows.append([
+            InlineKeyboardButton(
+                f"{CATEGORY_EMOJI.get(c, '📌')} {c}",
+                callback_data=f"setcat:{task_id}:{c}",
+            )
+            for c in cats[i:i + 4]
+        ])
+    rows.append([InlineKeyboardButton(f"✏️ /edit {task_id}", callback_data=f"edit:{task_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _undo_markup(task_ids: list[int]) -> InlineKeyboardMarkup:
+    csv = ",".join(str(i) for i in task_ids)
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("↩️ Undo", callback_data=f"undo:{csv}")
+    ]])
+
+
+# ---------------------------------------------------------------------------
+# Date keyword parsing for field-targeted /edit
+# ---------------------------------------------------------------------------
+
+def _parse_date_keyword(s: str) -> tuple[bool, date | None]:
+    """Return (ok, value). value=None means clear the date."""
+    s = s.strip().lower()
+    if s in ("none", "clear", "null", "off", "-"):
+        return True, None
+    if s == "today":
+        return True, date.today()
+    if s == "tomorrow":
+        return True, date.today() + timedelta(days=1)
+    if s.startswith("+") and s.endswith("d"):
+        try:
+            return True, date.today() + timedelta(days=int(s[1:-1]))
+        except ValueError:
+            return False, None
+    try:
+        return True, date.fromisoformat(s)
+    except ValueError:
+        return False, None
+
+
+# ---------------------------------------------------------------------------
+# Shared "added" reply renderer
+# ---------------------------------------------------------------------------
+
+async def _send_added_reply(send_fn, task: dict, *, parse_error: str | None = None,
+                            attachment_count: int = 0, prefix: str = "✅ Added"):
+    emoji = CATEGORY_EMOJI.get(task["category"], "📌")
+    lines = [
+        f"{prefix} (#{task['id']}):",
+        f"📌 {task['title']}",
+        f"{emoji} {task['category']}",
+    ]
+    if task.get("is_priority"):
+        lines.append("⭐ priority")
+    lines.append(f"📅 {fmt_date(task.get('due_date'))}")
+    if attachment_count == 1:
+        lines.append("📎 1 attachment")
+    elif attachment_count > 1:
+        lines.append(f"📎 {attachment_count} attachments")
+    if parse_error:
+        lines.append(f"\n⚠️ Parse warning: {parse_error}")
+    reply_markup = None
+    if task["category"] == "Unknown":
+        lines.append(f"\n❓ Couldn't detect category — tap below or use /edit {task['id']}.")
+        reply_markup = _category_picker_markup(task["id"])
+    await send_fn("\n".join(lines), reply_markup=reply_markup)
+
+
 # ---------------------------------------------------------------------------
 # /start
 # ---------------------------------------------------------------------------
@@ -74,15 +165,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
     await update.message.reply_text(
-        "👋 Todo bot ready.\n\n"
-        "Just send me any text to add a task.\n"
-        "Commands:\n"
-        "/list — show all open tasks\n"
-        "/done — mark tasks complete\n"
-        "/drop <id> — delete a task\n"
-        "/edit <id> — edit a task\n"
-        "/stats — counts per category\n"
-        "/sync — pull changes from Notion"
+        "👋 Todo bot ready. Send any text to add a task, or photos/documents with captions.\n"
+        "Type /help for the full command list, /menu for the keyboard."
     )
 
 
@@ -96,7 +180,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     raw = update.message.text.strip()
 
-    # Check if this looks like a "mark done" reply (numbers only, e.g. "1 3")
+    # Numeric reply marks listed tasks done
     if all(part.isdigit() for part in raw.split()):
         await _handle_done_reply(update, ctx, raw)
         return
@@ -108,29 +192,19 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     category = parsed["category"]
     due_date_str = parsed.get("due_date")
     due_date = date.fromisoformat(due_date_str) if due_date_str else None
+    is_priority = bool(parsed.get("is_priority", False))
     parse_error = parsed.get("error")
 
-    task_id = db.add_task(raw, title, category, due_date)
+    task_id = db.add_task(raw, title, category, due_date, is_priority=is_priority)
     _sync_task_to_notion(task_id)
 
-    emoji = CATEGORY_EMOJI.get(category, "📌")
-    lines = [
-        f"✅ Added (#{task_id}):",
-        f"📌 {title}",
-        f"{emoji} {category}",
-        f"📅 {fmt_date(due_date)}",
-    ]
-    if parse_error:
-        lines.append(f"\n⚠️ Parse warning: {parse_error}")
-
-    if category == "Unknown":
-        lines.append(f"\n❓ Couldn't detect category — tap the button or use /edit {task_id} to fix.")
-        await update.message.reply_text(
-            "\n".join(lines),
-            reply_markup=_edit_button(task_id),
-        )
-    else:
-        await update.message.reply_text("\n".join(lines))
+    task = db.get_task(task_id)
+    await _send_added_reply(
+        update.message.reply_text,
+        task,
+        parse_error=parse_error,
+        attachment_count=int(task.get("attachment_count") or 0),
+    )
 
 
 async def _handle_done_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
@@ -143,13 +217,13 @@ async def _handle_done_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tex
         return
 
     indices = [int(x) for x in text.split() if x.isdigit()]
-    marked = []
-    failed = []
+    marked: list[tuple[int, str]] = []  # (task_id, title)
+    failed: list[str] = []
     for idx in indices:
         if 1 <= idx <= len(session):
             task = session[idx - 1]
             if db.mark_done(task["id"]):
-                marked.append(task["title"])
+                marked.append((task["id"], task["title"]))
                 _sync_task_to_notion(task["id"])
             else:
                 failed.append(task["title"])
@@ -160,20 +234,29 @@ async def _handle_done_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tex
 
     lines = []
     if marked:
-        lines.append("✅ Done:\n" + "\n".join(f"  • {t}" for t in marked))
+        lines.append("✅ Done:\n" + "\n".join(f"  • {t}" for _, t in marked))
     if failed:
         lines.append("⚠️ Couldn't mark:\n" + "\n".join(f"  • {t}" for t in failed))
-    await update.message.reply_text("\n\n".join(lines) or "Nothing changed.")
+    text_out = "\n\n".join(lines) or "Nothing changed."
+
+    reply_markup = _undo_markup([tid for tid, _ in marked]) if marked else None
+    await update.message.reply_text(text_out, reply_markup=reply_markup)
 
 
 # ---------------------------------------------------------------------------
-# /list
+# /list [onlytext]
 # ---------------------------------------------------------------------------
 
 async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
+    args = ctx.args or []
+    only_text = bool(args and args[0].lower() == "onlytext")
     tasks = db.get_open_tasks()
+    if only_text:
+        ctx.user_data["task_list"] = []  # no numbered done flow
+        await update.message.reply_text(build_task_list_simple(tasks))
+        return
     ctx.user_data["task_list"] = tasks
     msg = build_task_list(tasks)
     if tasks:
@@ -220,14 +303,13 @@ async def cmd_drop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# /edit <id>
+# /edit <id> [field value]
 # ---------------------------------------------------------------------------
 
-EDIT_WAITING = {}  # simple in-memory state: chat_id → task_id
+EDIT_WAITING = {}  # chat_id → task_id
 
 
 async def _start_edit(chat_id: int, task_id: int, reply_fn) -> None:
-    """Shared logic for entering edit mode (used by command and callback)."""
     task = db.get_task(task_id)
     if not task:
         await reply_fn(f"Task #{task_id} not found.")
@@ -243,14 +325,70 @@ async def _start_edit(chat_id: int, task_id: int, reply_fn) -> None:
     )
 
 
+async def _edit_field(update: Update, task_id: int, field: str, value: str):
+    task = db.get_task(task_id)
+    if not task:
+        await update.message.reply_text(f"Task #{task_id} not found.")
+        return
+
+    if field == "title":
+        if not value.strip():
+            await update.message.reply_text("Need a title value.")
+            return
+        db.update_task(task_id, title=value.strip()[:500])
+    elif field == "category":
+        if value not in config.CATEGORIES:
+            await update.message.reply_text(
+                "Unknown category. Pick one of: " + ", ".join(config.CATEGORIES)
+            )
+            return
+        db.update_task(task_id, category=value)
+    elif field in ("date", "due"):
+        ok, d = _parse_date_keyword(value)
+        if not ok:
+            await update.message.reply_text(
+                "Couldn't parse date. Use YYYY-MM-DD, today, tomorrow, +Nd, or none."
+            )
+            return
+        db.update_task(task_id, due_date=d)
+    elif field == "priority":
+        v = value.strip().lower()
+        if v in ("on", "true", "1", "yes", "y"):
+            db.update_task(task_id, is_priority=True)
+        elif v in ("off", "false", "0", "no", "n"):
+            db.update_task(task_id, is_priority=False)
+        else:
+            await update.message.reply_text("Use: /edit <id> priority on|off")
+            return
+
+    _sync_task_to_notion(task_id)
+    new_task = db.get_task(task_id)
+    emoji = CATEGORY_EMOJI.get(new_task["category"], "📌")
+    lines = [
+        f"✅ Updated #{task_id}:",
+        f"📌 {new_task['title']}",
+        f"{emoji} {new_task['category']}",
+    ]
+    if new_task.get("is_priority"):
+        lines.append("⭐ priority")
+    lines.append(f"📅 {fmt_date(new_task['due_date'])}")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
-    args = ctx.args
+    args = ctx.args or []
     if not args or not args[0].isdigit():
-        await update.message.reply_text("Usage: /edit <task_id>")
+        await update.message.reply_text(
+            "Usage: /edit <task_id> [field value]\n"
+            "Fields: title, category, date, priority"
+        )
         return
     task_id = int(args[0])
+    if len(args) >= 2 and args[1].lower() in EDIT_FIELDS:
+        await _edit_field(update, task_id, args[1].lower(), " ".join(args[2:]))
+        return
     await _start_edit(
         update.effective_chat.id,
         task_id,
@@ -266,37 +404,301 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_edit_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Called when user sends text while an edit is pending."""
     chat_id = update.effective_chat.id
     task_id = EDIT_WAITING.pop(chat_id, None)
     if task_id is None:
-        return False  # not in edit mode
+        return False
 
     text = update.message.text.strip()
 
-    # If they just sent a category name
-    from config import CATEGORIES
-    if text in CATEGORIES:
+    if text in config.CATEGORIES:
         db.update_task(task_id, category=text)
         _sync_task_to_notion(task_id)
         await update.message.reply_text(f"✅ Category updated to {text}.")
         return True
 
-    # Re-parse full text
     await update.message.reply_text("⏳ Re-parsing…")
     parsed = claude_client.parse_task(text)
     due_date = date.fromisoformat(parsed["due_date"]) if parsed.get("due_date") else None
-    db.update_task(task_id, title=parsed["title"], category=parsed["category"], due_date=due_date)
+    db.update_task(
+        task_id,
+        title=parsed["title"],
+        category=parsed["category"],
+        due_date=due_date,
+        is_priority=bool(parsed.get("is_priority", False)),
+    )
     _sync_task_to_notion(task_id)
 
-    emoji = CATEGORY_EMOJI.get(parsed["category"], "📌")
-    await update.message.reply_text(
-        f"✅ Updated #{task_id}:\n"
-        f"📌 {parsed['title']}\n"
-        f"{emoji} {parsed['category']}\n"
-        f"📅 {fmt_date(due_date)}"
-    )
+    new_task = db.get_task(task_id)
+    emoji = CATEGORY_EMOJI.get(new_task["category"], "📌")
+    lines = [
+        f"✅ Updated #{task_id}:",
+        f"📌 {new_task['title']}",
+        f"{emoji} {new_task['category']}",
+    ]
+    if new_task.get("is_priority"):
+        lines.append("⭐ priority")
+    lines.append(f"📅 {fmt_date(new_task['due_date'])}")
+    await update.message.reply_text("\n".join(lines))
     return True
+
+
+# ---------------------------------------------------------------------------
+# /defer <id> [days]
+# ---------------------------------------------------------------------------
+
+async def cmd_defer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+    args = ctx.args or []
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Usage: /defer <task_id> [days]")
+        return
+    task_id = int(args[0])
+    days = 1
+    if len(args) >= 2:
+        try:
+            days = int(args[1])
+        except ValueError:
+            await update.message.reply_text("Days must be an integer.")
+            return
+    new_due = db.defer_task(task_id, days)
+    if new_due is None:
+        await update.message.reply_text(f"Task #{task_id} not found.")
+        return
+    _sync_task_to_notion(task_id)
+    await update.message.reply_text(f"📅 Deferred #{task_id} to {fmt_date(new_due)}.")
+
+
+# ---------------------------------------------------------------------------
+# /priority <id> [on|off]
+# ---------------------------------------------------------------------------
+
+async def cmd_priority(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+    args = ctx.args or []
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Usage: /priority <task_id> [on|off]")
+        return
+    task_id = int(args[0])
+    task = db.get_task(task_id)
+    if not task:
+        await update.message.reply_text(f"Task #{task_id} not found.")
+        return
+    if len(args) >= 2:
+        v = args[1].lower()
+        new_val = v in ("on", "true", "1", "yes", "y")
+    else:
+        new_val = not bool(task.get("is_priority"))
+    db.set_priority(task_id, new_val)
+    _sync_task_to_notion(task_id)
+    icon = "⭐" if new_val else "☆"
+    await update.message.reply_text(
+        f"{icon} Priority {'on' if new_val else 'off'} for #{task_id}: {task['title']}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# /search <query>
+# ---------------------------------------------------------------------------
+
+async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+    q = " ".join(ctx.args or []).strip()
+    if len(q) < 2:
+        await update.message.reply_text("Usage: /search <query> (≥2 chars)")
+        return
+    results = db.search_tasks(q)
+    ctx.user_data["task_list"] = results
+    if not results:
+        await update.message.reply_text(f"🔍 No matches for '{q}'.")
+        return
+    msg = build_task_list(results, header=f"🔍 Search results for '{q}':")
+    msg += "\n\nReply with numbers to mark done."
+    await update.message.reply_text(msg)
+
+
+# ---------------------------------------------------------------------------
+# /filter [category]
+# ---------------------------------------------------------------------------
+
+async def cmd_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+    args = ctx.args or []
+    if args and args[0] in config.CATEGORIES:
+        cat = args[0]
+        results = db.get_tasks_by_category(cat)
+        ctx.user_data["task_list"] = results
+        emoji = CATEGORY_EMOJI.get(cat, "📌")
+        msg = build_task_list(results, header=f"📂 {emoji} {cat}:")
+        if results:
+            msg += "\n\nReply with numbers to mark done."
+        await update.message.reply_text(msg)
+        return
+
+    cats = [c for c in config.CATEGORIES if c != "Unknown"]
+    rows: list[list[InlineKeyboardButton]] = []
+    for i in range(0, len(cats), 4):
+        rows.append([
+            InlineKeyboardButton(
+                f"{CATEGORY_EMOJI.get(c, '📌')} {c}",
+                callback_data=f"filter:{c}",
+            )
+            for c in cats[i:i + 4]
+        ])
+    rows.append([
+        InlineKeyboardButton(
+            f"{CATEGORY_EMOJI['Unknown']} Unknown",
+            callback_data="filter:Unknown",
+        )
+    ])
+    await update.message.reply_text(
+        "📂 Filter by category:",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+# ---------------------------------------------------------------------------
+# /history [days]
+# ---------------------------------------------------------------------------
+
+async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+    args = ctx.args or []
+    days = 7
+    if args and args[0].isdigit():
+        days = int(args[0])
+    rows = db.get_done_tasks(days)
+    if not rows:
+        await update.message.reply_text(f"No completed tasks in the last {days} day(s).")
+        return
+
+    today = date.today()
+    groups: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for t in rows:
+        d = t["done_at"]
+        if isinstance(d, datetime):
+            d = d.date()
+        if d == today:
+            label = "Today"
+        elif d == today - timedelta(days=1):
+            label = "Yesterday"
+        elif (today - d).days < 7:
+            label = d.strftime("%A")
+        else:
+            label = d.strftime("%a %d %b")
+        if label not in groups:
+            groups[label] = []
+            order.append(label)
+        groups[label].append(t)
+
+    lines = [f"📅 Completed in the last {days} day(s):", ""]
+    for label in order:
+        lines.append(f"— {label}")
+        for t in groups[label]:
+            emoji = CATEGORY_EMOJI.get(t["category"], "📌")
+            star = "⭐ " if t.get("is_priority") else ""
+            lines.append(f"  ✅ {star}{emoji} {t['title']} — {t['category']}")
+        lines.append("")
+    await update.message.reply_text("\n".join(lines).rstrip())
+
+
+# ---------------------------------------------------------------------------
+# /show <id>
+# ---------------------------------------------------------------------------
+
+async def cmd_show(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+    args = ctx.args or []
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Usage: /show <task_id>")
+        return
+    task_id = int(args[0])
+    task = db.get_task(task_id)
+    if not task:
+        await update.message.reply_text(f"Task #{task_id} not found.")
+        return
+    await update.message.reply_text(fmt_task_detail(task), reply_markup=_edit_button(task_id))
+
+    chat_id = update.effective_chat.id
+    for att in db.get_attachments(task_id):
+        kind = att["kind"]
+        cap = att.get("caption") or None
+        try:
+            if kind == "photo":
+                await ctx.bot.send_photo(chat_id, att["file_id"], caption=cap)
+            elif kind == "document":
+                await ctx.bot.send_document(chat_id, att["file_id"], caption=cap)
+            elif kind == "voice":
+                await ctx.bot.send_voice(chat_id, att["file_id"], caption=cap)
+            elif kind == "audio":
+                await ctx.bot.send_audio(chat_id, att["file_id"], caption=cap)
+            elif kind == "video":
+                await ctx.bot.send_video(chat_id, att["file_id"], caption=cap)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Failed to resend attachment %s: %s", att["id"], e)
+
+
+# ---------------------------------------------------------------------------
+# /menu
+# ---------------------------------------------------------------------------
+
+async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+    keyboard = ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("/list"), KeyboardButton("/done"), KeyboardButton("/search")],
+            [KeyboardButton("/history"), KeyboardButton("/stats"), KeyboardButton("/help")],
+        ],
+        resize_keyboard=True,
+    )
+    await update.message.reply_text("📲 Menu set.", reply_markup=keyboard)
+
+
+# ---------------------------------------------------------------------------
+# /help
+# ---------------------------------------------------------------------------
+
+HELP_TEXT = (
+    "🤖 Notetaker Bot\n\n"
+    "Adding\n"
+    "• Send any text to add a task\n"
+    "• Send a photo or document with caption to attach a file\n\n"
+    "Viewing\n"
+    "/list — open tasks (numbered)\n"
+    "/list onlytext — compact bullet list\n"
+    "/show <id> — task detail + attachments\n"
+    "/search <query> — find tasks by title/text\n"
+    "/filter [category] — filter by category\n"
+    "/history [days] — recently completed (default 7d)\n"
+    "/stats — counts per category\n\n"
+    "Modifying\n"
+    "/done — pick numbered tasks to complete\n"
+    "/edit <id> — re-parse from new text\n"
+    "/edit <id> <field> <value> — set title|category|date|priority\n"
+    "/defer <id> [days] — push due date back (default 1)\n"
+    "/priority <id> [on|off] — toggle ⭐\n"
+    "/drop <id> — delete\n\n"
+    "Notion\n"
+    "/sync — pull changes from Notion\n"
+    "/pushnotion — push DB tasks to Notion\n\n"
+    "Misc\n"
+    "/menu — show keyboard\n"
+    "/cancel — abort an /edit"
+)
+
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+    await update.message.reply_text(HELP_TEXT)
 
 
 # ---------------------------------------------------------------------------
@@ -325,18 +727,200 @@ async def cmd_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
     if not notion.enabled():
-        await update.message.reply_text("⚠️ Notion is not configured (missing NOTION_API_KEY / NOTION_DATABASE_ID).")
+        await update.message.reply_text(
+            "⚠️ Notion is not configured (missing NOTION_API_KEY / NOTION_DATABASE_ID)."
+        )
         return
     await update.message.reply_text("🔄 Pulling changes from Notion…")
     changes = notion.sync_from_notion()
     if changes:
-        await update.message.reply_text("✅ Synced from Notion:\n" + "\n".join(f"• {c}" for c in changes))
+        await update.message.reply_text(
+            "✅ Synced from Notion:\n" + "\n".join(f"• {c}" for c in changes)
+        )
     else:
         await update.message.reply_text("✅ Nothing to sync — Notion is up to date.")
 
 
 # ---------------------------------------------------------------------------
-# Callback query handler (inline buttons)
+# /pushnotion — bulk push tasks lacking notion_page_id
+# ---------------------------------------------------------------------------
+
+async def cmd_pushnotion(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+    if not notion.enabled():
+        await update.message.reply_text("⚠️ Notion is not configured.")
+        return
+    args = ctx.args or []
+    include_done = bool(args and args[0].lower() == "all")
+    rows = db.get_tasks_without_notion_page()
+    if not include_done:
+        rows = [r for r in rows if not r.get("is_done")]
+    if not rows:
+        await update.message.reply_text("✅ Nothing to push — all tasks already in Notion.")
+        return
+
+    await update.message.reply_text(f"📤 Pushing {len(rows)} task(s) to Notion…")
+    pushed = 0
+    failed = 0
+    for i, t in enumerate(rows, 1):
+        page_id, synced_at = notion.create_page(t)
+        if page_id:
+            db.set_notion_page_id(t["id"], page_id, synced_at)
+            pushed += 1
+        else:
+            failed += 1
+        if len(rows) > 20 and i % 10 == 0 and i < len(rows):
+            await update.message.reply_text(f"… {i}/{len(rows)}")
+        await asyncio.sleep(0.35)
+    msg = f"📤 Pushed {pushed} task(s) to Notion."
+    if failed:
+        msg += f" ({failed} failed)"
+    await update.message.reply_text(msg)
+
+
+# ---------------------------------------------------------------------------
+# Attachments
+# ---------------------------------------------------------------------------
+
+# (chat_id, media_group_id) → {"lock": Lock, "task_id": int|None, "first_done": bool}
+MEDIA_BUFFER: dict[tuple[int, str], dict] = {}
+
+
+def _create_task_for_caption(caption: str | None) -> tuple[int, str | None, str]:
+    """Create a task from a caption, or a placeholder if none. Returns (task_id, parse_error, raw_text)."""
+    if caption and caption.strip():
+        raw = caption.strip()
+        parsed = claude_client.parse_task(raw)
+        title = parsed["title"]
+        category = parsed["category"]
+        due_str = parsed.get("due_date")
+        due_date = date.fromisoformat(due_str) if due_str else None
+        is_priority = bool(parsed.get("is_priority", False))
+        task_id = db.add_task(raw, title, category, due_date, is_priority=is_priority)
+        return task_id, parsed.get("error"), raw
+    task_id = db.add_task("📎 (attachment)", "📎 Untitled attachment", "Unknown", None, is_priority=False)
+    return task_id, None, "📎 (attachment)"
+
+
+def _update_task_from_caption(task_id: int, caption: str) -> str | None:
+    """Re-parse caption and overwrite title/category/date/priority on the task."""
+    parsed = claude_client.parse_task(caption.strip())
+    due_str = parsed.get("due_date")
+    due_date = date.fromisoformat(due_str) if due_str else None
+    db.update_task(
+        task_id,
+        title=parsed["title"],
+        category=parsed["category"],
+        due_date=due_date,
+        is_priority=bool(parsed.get("is_priority", False)),
+    )
+    return parsed.get("error")
+
+
+async def _delayed_album_reply(msg, key: tuple[int, str], task_id: int, parse_error_box: dict):
+    """Sleep briefly so sibling album items can attach, then send one combined reply."""
+    await asyncio.sleep(2.0)
+    MEDIA_BUFFER.pop(key, None)
+    task = db.get_task(task_id)
+    if not task:
+        return
+    await _send_added_reply(
+        msg.reply_text,
+        task,
+        parse_error=parse_error_box.get("parse_error"),
+        attachment_count=int(task.get("attachment_count") or 0),
+    )
+
+
+async def _process_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                         kind: str, file_id: str, file_unique_id: str,
+                         file_name: str | None, mime_type: str | None,
+                         caption: str | None):
+    chat_id = update.effective_chat.id
+    msg = update.message
+    media_group_id = msg.media_group_id
+
+    if media_group_id:
+        key = (chat_id, media_group_id)
+        buf = MEDIA_BUFFER.get(key)
+        if buf is None:
+            buf = {"lock": asyncio.Lock(), "task_id": None, "parse_error": None}
+            MEDIA_BUFFER[key] = buf
+
+        first = False
+        async with buf["lock"]:
+            if buf["task_id"] is None:
+                tid, err, _ = _create_task_for_caption(caption)
+                buf["task_id"] = tid
+                buf["parse_error"] = err
+                first = True
+            else:
+                # If this album item carries the caption, retrofit the task title
+                if caption and caption.strip():
+                    err = _update_task_from_caption(buf["task_id"], caption)
+                    if err and not buf["parse_error"]:
+                        buf["parse_error"] = err
+            task_id = buf["task_id"]
+
+        db.add_attachment(task_id, file_id, file_unique_id, kind, file_name, mime_type, caption)
+        _sync_task_to_notion(task_id)
+
+        if first:
+            # Schedule the reply asynchronously so the next album item can be
+            # processed immediately even when PTB processes updates sequentially.
+            asyncio.create_task(_delayed_album_reply(msg, key, task_id, buf))
+        return
+
+    # Single message (no album)
+    task_id, parse_error, _ = _create_task_for_caption(caption)
+    db.add_attachment(task_id, file_id, file_unique_id, kind, file_name, mime_type, caption)
+    _sync_task_to_notion(task_id)
+    task = db.get_task(task_id)
+    await _send_added_reply(
+        msg.reply_text,
+        task,
+        parse_error=parse_error,
+        attachment_count=int(task.get("attachment_count") or 0),
+    )
+
+
+async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+    if not update.message or not update.message.photo:
+        return
+    largest = update.message.photo[-1]
+    await _process_media(
+        update, ctx,
+        kind="photo",
+        file_id=largest.file_id,
+        file_unique_id=largest.file_unique_id,
+        file_name=None,
+        mime_type=None,
+        caption=update.message.caption,
+    )
+
+
+async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+    doc = update.message.document if update.message else None
+    if not doc:
+        return
+    await _process_media(
+        update, ctx,
+        kind="document",
+        file_id=doc.file_id,
+        file_unique_id=doc.file_unique_id,
+        file_name=doc.file_name,
+        mime_type=doc.mime_type,
+        caption=update.message.caption,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Callback query handler
 # ---------------------------------------------------------------------------
 
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -347,6 +931,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     data = query.data or ""
+
     if data.startswith("edit:"):
         task_id = int(data.split(":", 1)[1])
         await _start_edit(
@@ -354,10 +939,78 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             task_id,
             query.message.reply_text,
         )
+        return
+
+    if data.startswith("setcat:"):
+        _, raw_id, cat = data.split(":", 2)
+        task_id = int(raw_id)
+        if cat not in config.CATEGORIES:
+            await query.message.reply_text(f"Unknown category: {cat}")
+            return
+        db.update_task(task_id, category=cat)
+        _sync_task_to_notion(task_id)
+        task = db.get_task(task_id)
+        if not task:
+            await query.message.reply_text(f"Task #{task_id} not found.")
+            return
+        emoji = CATEGORY_EMOJI.get(cat, "📌")
+        lines = [
+            f"✅ Updated (#{task_id}):",
+            f"📌 {task['title']}",
+            f"{emoji} {task['category']}",
+        ]
+        if task.get("is_priority"):
+            lines.append("⭐ priority")
+        lines.append(f"📅 {fmt_date(task['due_date'])}")
+        try:
+            await query.edit_message_text("\n".join(lines), reply_markup=_edit_button(task_id))
+        except Exception as e:  # noqa: BLE001
+            log.warning("edit_message_text (setcat) failed: %s", e)
+            await query.message.reply_text("\n".join(lines), reply_markup=_edit_button(task_id))
+        return
+
+    if data.startswith("undo:"):
+        ids_str = data.split(":", 1)[1]
+        ids = [int(x) for x in ids_str.split(",") if x.strip().isdigit()]
+        reopened: list[str] = []
+        for tid in ids:
+            if db.mark_open(tid):
+                _sync_task_to_notion(tid)
+                t = db.get_task(tid)
+                if t:
+                    reopened.append(t["title"])
+        if reopened:
+            text = "↩️ Reopened:\n" + "\n".join(f"  • {t}" for t in reopened)
+        else:
+            text = "Nothing to undo."
+        try:
+            await query.edit_message_text(text)  # also drops the button
+        except Exception as e:  # noqa: BLE001
+            log.warning("edit_message_text (undo) failed: %s", e)
+            await query.message.reply_text(text)
+        return
+
+    if data.startswith("filter:"):
+        cat = data.split(":", 1)[1]
+        if cat not in config.CATEGORIES:
+            await query.message.reply_text(f"Unknown category: {cat}")
+            return
+        results = db.get_tasks_by_category(cat)
+        ctx.user_data["task_list"] = results
+        emoji = CATEGORY_EMOJI.get(cat, "📌")
+        msg = build_task_list(results, header=f"📂 {emoji} {cat}:")
+        if results:
+            msg += "\n\nReply with numbers to mark done."
+        try:
+            await query.edit_message_text(msg)
+        except Exception as e:  # noqa: BLE001
+            log.warning("edit_message_text (filter) failed: %s", e)
+            await query.message.reply_text(msg)
+        return
 
 
 # ---------------------------------------------------------------------------
-# Unified text handler (routes edit replies first, then free-text add)
+# Unified text handler
 # ---------------------------------------------------------------------------
 
 async def text_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -374,11 +1027,39 @@ async def text_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # App entry point
 # ---------------------------------------------------------------------------
 
+async def _post_init(app):
+    await app.bot.set_my_commands([
+        BotCommand("list", "Show open tasks"),
+        BotCommand("done", "Mark tasks as done"),
+        BotCommand("search", "Search tasks"),
+        BotCommand("filter", "Filter by category"),
+        BotCommand("history", "Recently completed"),
+        BotCommand("show", "Show task detail"),
+        BotCommand("edit", "Edit a task"),
+        BotCommand("defer", "Push due date later"),
+        BotCommand("priority", "Toggle ⭐ priority"),
+        BotCommand("drop", "Delete a task"),
+        BotCommand("stats", "Counts per category"),
+        BotCommand("sync", "Pull from Notion"),
+        BotCommand("pushnotion", "Push tasks to Notion"),
+        BotCommand("menu", "Show keyboard menu"),
+        BotCommand("help", "Show all commands"),
+        BotCommand("cancel", "Cancel /edit"),
+    ])
+
+
 def main():
     db.init_db()
-    app = ApplicationBuilder().token(config.TELEGRAM_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(config.TELEGRAM_TOKEN)
+        .post_init(_post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("done", cmd_done))
     app.add_handler(CommandHandler("drop", cmd_drop))
@@ -386,7 +1067,16 @@ def main():
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("sync", cmd_sync))
+    app.add_handler(CommandHandler("pushnotion", cmd_pushnotion))
+    app.add_handler(CommandHandler("search", cmd_search))
+    app.add_handler(CommandHandler("filter", cmd_filter))
+    app.add_handler(CommandHandler("history", cmd_history))
+    app.add_handler(CommandHandler("show", cmd_show))
+    app.add_handler(CommandHandler("defer", cmd_defer))
+    app.add_handler(CommandHandler("priority", cmd_priority))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
     log.info("Bot starting…")

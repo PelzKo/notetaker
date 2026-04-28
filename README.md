@@ -3,12 +3,36 @@
 | Command | Action |
 |---------|--------|
 | /list | Show all open tasks, numbered, with mark-done prompt |
+| /list onlytext | Compact bullet list (no emojis or dates) — IDs only |
+| /show &lt;id&gt; | Show full task detail and re-send any attachments |
+| /search &lt;query&gt; | Find open tasks whose title or original text contains the query |
+| /filter [category] | Filter open tasks by category (no arg → category picker buttons) |
+| /history [days] | List tasks completed in the last N days (default 7), grouped by date |
 | /done | Show numbered list to pick from (same as after summary) |
-| /add <text> | Explicit add (same as free text) |
-| /edit <id> | Bot asks what to change (category, due date, title) |
-| /drop <id> | Delete a task permanently |
+| /edit &lt;id&gt; | Bot asks what to change (free-text re-parse mode) |
+| /edit &lt;id&gt; &lt;field&gt; &lt;value&gt; | Set a single field: `title`, `category`, `date`, `priority` |
+| /defer &lt;id&gt; [days] | Push the due date later by N days (default 1) |
+| /priority &lt;id&gt; [on\|off] | Toggle ⭐ priority (no arg → toggle) |
+| /drop &lt;id&gt; | Delete a task permanently |
 | /stats | Quick counts per category |
 | /sync | Pull any Notion changes into MariaDB on demand |
+| /pushnotion [all] | Push every DB task missing a Notion page to Notion (open only by default) |
+| /menu | Show a persistent reply keyboard with the most-used commands |
+| /help | Print every command grouped by purpose |
+| /cancel | Abort an in-progress /edit |
+
+### Adding tasks
+
+- Send any text to add a task — Claude parses it into title, category, due date, and ⭐ priority (urgency keywords like "urgent", "asap", "wichtig", "dringend" set priority to true).
+- Send a photo or document **with a caption** — the caption is parsed as the task text and the file is attached. The Telegram `file_id` is stored; nothing is uploaded to your server or to Notion. Tasks with attachments show a 📎 badge in `/list` and a checkbox in Notion (if the property exists).
+- Album uploads (multiple photos at once) are coalesced into a single task with multiple attachments.
+- Photos/documents sent without a caption create a placeholder task you can rename via `/edit`.
+
+### Inline buttons
+
+- After `/done`, an **↩️ Undo** button lets you re-open the most recently completed tasks.
+- New tasks parsed as `Unknown` come with quick-pick category buttons.
+- `/filter` with no argument shows a one-tap category picker.
 
 Assuming you clone the repository into ~/notetaker with
 ```bash
@@ -126,6 +150,8 @@ Create a new **full-page database** in Notion (not an inline/embedded one — it
 | `Done`        | Checkbox | |
 | `Done At`     | Date   | |
 | `Task ID`     | Number | Used to link Notion pages back to MariaDB rows |
+| `Priority`    | Checkbox | Optional. ⭐ flag synced both ways; bot skips it gracefully if you don't add it |
+| `Attachment`  | Checkbox | Optional. Set automatically when a task has Telegram attachments (read-only, files stay in Telegram) |
 
 ### 5c. Get the database ID
 
