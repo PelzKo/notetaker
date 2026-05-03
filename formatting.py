@@ -42,11 +42,11 @@ def _badges(task: dict) -> str:
     return " ".join(parts)
 
 
-def fmt_task_line(index: int, task: dict) -> str:
+def fmt_task_line(task: dict) -> str:
     emoji = CATEGORY_EMOJI.get(task["category"], "📌")
     due = fmt_date(task.get("due_date"))
     badges = _badges(task)
-    line = f"{index}. {emoji} {task['title']} (#{task['id']}) — {task['category']} — {due}"
+    line = f"• {emoji} {task['title']} #{task['id']} — {task['category']} — {due}"
     if badges:
         line = f"{line} {badges}"
     return line
@@ -56,8 +56,8 @@ def build_task_list(tasks: list[dict], header: str = "📋 Open tasks:") -> str:
     if not tasks:
         return "✅ No open tasks."
     lines = [header, ""]
-    for i, t in enumerate(tasks, 1):
-        lines.append(fmt_task_line(i, t))
+    for t in tasks:
+        lines.append(fmt_task_line(t))
     return "\n".join(lines)
 
 
@@ -68,7 +68,7 @@ def build_task_list_simple(tasks: list[dict], header: str = "📋 Open tasks:") 
     lines = [header]
     for t in tasks:
         prio = "⭐ " if t.get("is_priority") else ""
-        lines.append(f"• {prio}{t['title']} (#{t['id']})")
+        lines.append(f"• {prio}{t['title']} #{t['id']}")
     return "\n".join(lines)
 
 

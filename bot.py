@@ -29,7 +29,6 @@ from formatting import (
     build_task_list_simple,
     fmt_date,
     fmt_task_detail,
-    fmt_task_line,
 )
 
 logging.basicConfig(
@@ -208,7 +207,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _handle_done_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
-    """Handle a reply like '1 3' that marks numbered tasks done."""
+    """Handle a reply like '42 17' that marks tasks done by their IDs."""
     session = ctx.user_data.get("task_list", [])
     if not session:
         await update.message.reply_text(
@@ -216,19 +215,20 @@ async def _handle_done_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tex
         )
         return
 
-    indices = [int(x) for x in text.split() if x.isdigit()]
+    session_ids = {t["id"]: t for t in session}
+    ids = [int(x) for x in text.split() if x.isdigit()]
     marked: list[tuple[int, str]] = []  # (task_id, title)
     failed: list[str] = []
-    for idx in indices:
-        if 1 <= idx <= len(session):
-            task = session[idx - 1]
+    for task_id in ids:
+        if task_id in session_ids:
+            task = session_ids[task_id]
             if db.mark_done(task["id"]):
                 marked.append((task["id"], task["title"]))
                 _sync_task_to_notion(task["id"])
             else:
                 failed.append(task["title"])
         else:
-            failed.append(f"#{idx} (out of range)")
+            failed.append(f"#{task_id} (not in list)")
 
     ctx.user_data["task_list"] = []  # clear session
 
@@ -260,8 +260,16 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["task_list"] = tasks
     msg = build_task_list(tasks)
     if tasks:
-        msg += "\n\nReply with numbers to mark done (e.g. '1 3')."
+        msg += "\n\nReply with task IDs to mark done."
     await update.message.reply_text(msg)
+
+
+async def cmd_listtext(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+    tasks = db.get_open_tasks()
+    ctx.user_data["task_list"] = []
+    await update.message.reply_text(build_task_list_simple(tasks))
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +284,7 @@ async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ No open tasks.")
         return
     ctx.user_data["task_list"] = tasks
-    msg = build_task_list(tasks, "Which tasks are done? Reply with numbers (e.g. '1 3'):")
+    msg = build_task_list(tasks, "Which tasks are done? Reply with task IDs:")
     await update.message.reply_text(msg)
 
 
@@ -516,7 +524,7 @@ async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🔍 No matches for '{q}'.")
         return
     msg = build_task_list(results, header=f"🔍 Search results for '{q}':")
-    msg += "\n\nReply with numbers to mark done."
+    msg += "\n\nReply with task IDs to mark done."
     await update.message.reply_text(msg)
 
 
@@ -535,7 +543,7 @@ async def cmd_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         emoji = CATEGORY_EMOJI.get(cat, "📌")
         msg = build_task_list(results, header=f"📂 {emoji} {cat}:")
         if results:
-            msg += "\n\nReply with numbers to mark done."
+            msg += "\n\nReply with task IDs to mark done."
         await update.message.reply_text(msg)
         return
 
@@ -672,7 +680,7 @@ HELP_TEXT = (
     "• Send any text to add a task\n"
     "• Send a photo or document with caption to attach a file\n\n"
     "Viewing\n"
-    "/list — open tasks (numbered)\n"
+    "/list — open tasks with IDs\n"
     "/list onlytext — compact bullet list\n"
     "/show <id> — task detail + attachments\n"
     "/search <query> — find tasks by title/text\n"
@@ -680,7 +688,7 @@ HELP_TEXT = (
     "/history [days] — recently completed (default 7d)\n"
     "/stats — counts per category\n\n"
     "Modifying\n"
-    "/done — pick numbered tasks to complete\n"
+    "/done — mark tasks done by ID\n"
     "/edit <id> — re-parse from new text\n"
     "/edit <id> <field> <value> — set title|category|date|priority\n"
     "/defer <id> [days] — push due date back (default 1)\n"
@@ -1000,7 +1008,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         emoji = CATEGORY_EMOJI.get(cat, "📌")
         msg = build_task_list(results, header=f"📂 {emoji} {cat}:")
         if results:
-            msg += "\n\nReply with numbers to mark done."
+            msg += "\n\nReply with task IDs to mark done."
         try:
             await query.edit_message_text(msg)
         except Exception as e:  # noqa: BLE001
@@ -1030,6 +1038,7 @@ async def text_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _post_init(app):
     await app.bot.set_my_commands([
         BotCommand("list", "Show open tasks"),
+        BotCommand("listtext", "Compact text-only task list"),
         BotCommand("done", "Mark tasks as done"),
         BotCommand("search", "Search tasks"),
         BotCommand("filter", "Filter by category"),
@@ -1061,6 +1070,7 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("listtext", cmd_listtext))
     app.add_handler(CommandHandler("done", cmd_done))
     app.add_handler(CommandHandler("drop", cmd_drop))
     app.add_handler(CommandHandler("edit", cmd_edit))

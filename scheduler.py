@@ -8,9 +8,9 @@ from datetime import date
 
 import config
 import db
-import claude_client
 import google_calendar
 import notion
+import interesting_reads
 from formatting import CATEGORY_EMOJI, fmt_date, fmt_task_line, build_task_list
 
 
@@ -52,12 +52,10 @@ def build_summary() -> tuple[str, list[dict]]:
     if not all_tasks and not any(cal_events.get(k) for k in ("today", "tomorrow")):
         sections.append("✅ Nothing urgent and calendar is clear!")
         return "\n".join(sections), []
- 
-    # ── NEW: pass calendar events into the AI summary prompt ──
-    ai_comment = claude_client.generate_summary_comment(tasks, cal_events)
-    # ─────────────────────────────────────────────────────────
-    if ai_comment:
-        sections.append(f"🤖 Priority tip:\n{ai_comment}")
+
+    reads = interesting_reads.get_interesting_reads()
+    if reads:
+        sections.append("Interesting reads:\n" + "\n".join(f"• {url}" for url in reads))
  
     return "\n".join(sections), all_tasks
 
