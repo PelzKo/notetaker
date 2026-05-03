@@ -1,7 +1,12 @@
 import json
+import re
 import httpx
-from datetime import date
+from datetime import date, datetime
 import config
+
+_RECURRENCE_RE = re.compile(
+    r"^(daily|weekday|weekly:(mon|tue|wed|thu|fri|sat|sun)|monthly:(?:[1-9]|[12][0-9]|3[01]))$"
+)
 
 API_URL = "https://api.anthropic.com/v1/messages"
 HEADERS = {
@@ -22,13 +27,28 @@ Categories:
 - Unknown: truly ambiguous
 
 Return ONLY valid JSON, no markdown, no explanation. Only return the string and do not surround it with quotes or the description "json":
-{"title": "...", "category": "...", "due_date": "YYYY-MM-DD or null", "is_priority": true|false}
+{"title": "...", "category": "...", "due_date": "YYYY-MM-DD or null", "is_priority": true|false, "recurrence": "<pattern or null>", "remind_at": "YYYY-MM-DD HH:MM or null"}
 
 Title should be imperative and concise (max 80 chars).
 For due dates: interpret relative dates using today as {today}.
 If no date is mentioned, return null.
 Set is_priority to true when the text contains explicit urgency signals such as "urgent",
-"important", "asap", "high priority", "wichtig", "dringend", "eilig", "sofort", "!". Default false."""
+"important", "asap", "high priority", "wichtig", "dringend", "eilig", "sofort", "!". Default false.
+
+Recurrence (default null) — set when the text describes a repeating task. Allowed patterns:
+- "daily" — every day
+- "weekday" — every Mon-Fri
+- "weekly:<mon|tue|wed|thu|fri|sat|sun>" — every given weekday (English 3-letter)
+- "monthly:<1-31>" — every month on the given day-of-month
+Examples: "every Monday" → weekly:mon; "jeden Dienstag" → weekly:tue; "monthly on the 15th" → monthly:15;
+"every weekday" / "Mo-Fr" → weekday; "täglich" / "every day" → daily.
+If the text says "every day at 7am", set recurrence="daily" AND remind_at to today's 07:00 (or tomorrow's
+07:00 if it's already past 07:00 today).
+
+remind_at (default null) — set when the text contains a time-of-day reminder ("at 3pm", "in 2 hours",
+"um 14 Uhr", "tomorrow at 9", "heute Abend 20:00"). Combine with the resolved due_date when one was given,
+otherwise use today's date if the time is later than now, else tomorrow's. Use 24-hour HH:MM format.
+If only a date is mentioned (no time), leave remind_at null."""
 
 SUMMARY_SYSTEM = """You are a helpful personal assistant giving a brief, direct priority recommendation.
 You will receive a list of tasks grouped as overdue, due soon, and long-pending.
@@ -68,6 +88,25 @@ def parse_task(raw_text: str) -> dict:
                 parsed["due_date"] = None
         # Coerce priority to a strict bool
         parsed["is_priority"] = bool(parsed.get("is_priority", False))
+
+        # Validate recurrence
+        rec = parsed.get("recurrence")
+        if rec and isinstance(rec, str) and _RECURRENCE_RE.match(rec.strip().lower()):
+            parsed["recurrence"] = rec.strip().lower()
+        else:
+            parsed["recurrence"] = None
+
+        # Validate remind_at
+        ra = parsed.get("remind_at")
+        if ra and isinstance(ra, str):
+            try:
+                datetime.strptime(ra.strip(), "%Y-%m-%d %H:%M")
+                parsed["remind_at"] = ra.strip()
+            except ValueError:
+                parsed["remind_at"] = None
+        else:
+            parsed["remind_at"] = None
+
         return parsed
     except Exception as e:
         # Graceful fallback — save with raw text as title
@@ -76,6 +115,8 @@ def parse_task(raw_text: str) -> dict:
             "category": "Unknown",
             "due_date": None,
             "is_priority": False,
+            "recurrence": None,
+            "remind_at": None,
             "error": str(e),
         }
 

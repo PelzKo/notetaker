@@ -99,6 +99,11 @@ def _task_to_properties(task: dict) -> dict:
         props["Priority"] = {"checkbox": bool(task.get("is_priority", False))}
     if "Attachment" in schema:
         props["Attachment"] = {"checkbox": int(task.get("attachment_count") or 0) > 0}
+    if "Recurrence" in schema:
+        rec = task.get("recurrence") or ""
+        props["Recurrence"] = {
+            "rich_text": [{"text": {"content": rec[:120]}}] if rec else []
+        }
 
     return props
 

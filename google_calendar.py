@@ -112,6 +112,7 @@ def get_events(days_ahead: int = 1) -> dict[str, list[dict]]:
             start = item["start"]
             end = item["end"]
 
+            duration_min = 0
             if "date" in start:
                 all_day = True
                 event_date = start["date"]
@@ -124,6 +125,7 @@ def get_events(days_ahead: int = 1) -> dict[str, list[dict]]:
                 event_date = start_dt.date().isoformat()
                 start_str = start_dt.strftime("%H:%M")
                 end_str = end_dt.strftime("%H:%M")
+                duration_min = int((end_dt - start_dt).total_seconds() // 60)
 
             title = item.get("summary", "(no title)")
             dedup_key = (title, start_str, event_date)
@@ -131,7 +133,14 @@ def get_events(days_ahead: int = 1) -> dict[str, list[dict]]:
                 continue
             seen.add(dedup_key)
 
-            event = {"title": title, "start": start_str, "end": end_str, "all_day": all_day}
+            event = {
+                "id": item.get("id", ""),
+                "title": title,
+                "start": start_str,
+                "end": end_str,
+                "all_day": all_day,
+                "duration_min": duration_min,
+            }
 
             if event_date == today_str:
                 buckets["today"].append(event)

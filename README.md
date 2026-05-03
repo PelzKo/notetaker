@@ -13,6 +13,8 @@
 | /edit &lt;id&gt; &lt;field&gt; &lt;value&gt; | Set a single field: `title`, `category`, `date`, `priority` |
 | /defer &lt;id&gt; [days] | Push the due date later by N days (default 1) |
 | /priority &lt;id&gt; [on\|off] | Toggle ⭐ priority (no arg → toggle) |
+| /snooze &lt;id&gt; &lt;1h\|30m\|tomorrow\|mon&gt; | Push a reminder forward |
+| /next | Suggest one task to do right now (skips if you're in a meeting) |
 | /drop &lt;id&gt; | Delete a task permanently |
 | /stats | Quick counts per category |
 | /sync | Pull any Notion changes into MariaDB on demand |
@@ -23,16 +25,24 @@
 
 ### Adding tasks
 
-- Send any text to add a task — Claude parses it into title, category, due date, and ⭐ priority (urgency keywords like "urgent", "asap", "wichtig", "dringend" set priority to true).
+- Send any text to add a task — Claude parses it into title, category, due date, ⭐ priority, recurrence, and an optional reminder time.
+- "every Monday", "jeden Dienstag", "monthly on the 15th", "every weekday", "daily" all create recurring tasks. When marked done, the next instance is auto-scheduled.
+- "remind me at 3pm to call mum" or "tomorrow at 9 dentist" sets a one-shot reminder fired by the per-minute reminder cron.
+- Pasting a URL by itself fetches the page title and uses it as the task name; the original URL is kept in `raw_text`.
+- Forwarded messages are treated as captured items.
+- Urgency keywords ("urgent", "asap", "wichtig", "dringend") set priority to true.
 - Send a photo or document **with a caption** — the caption is parsed as the task text and the file is attached. The Telegram `file_id` is stored; nothing is uploaded to your server or to Notion. Tasks with attachments show a 📎 badge in `/list` and a checkbox in Notion (if the property exists).
 - Album uploads (multiple photos at once) are coalesced into a single task with multiple attachments.
 - Photos/documents sent without a caption create a placeholder task you can rename via `/edit`.
 
 ### Inline buttons
 
+- Every freshly captured task comes with **⭐ Priority / 📅 Today / 📅 Tomorrow / +1d / ✏️ /edit / ❌ Drop** buttons.
 - After `/done`, an **↩️ Undo** button lets you re-open the most recently completed tasks.
 - New tasks parsed as `Unknown` come with quick-pick category buttons.
 - `/filter` with no argument shows a one-tap category picker.
+- Reminders sent by `reminder_check.py` come with **✅ Done / 💤 Snooze 1h / 🌅 Tomorrow AM** buttons.
+- The Sunday weekly review surfaces stale tasks with **❌ Drop / 📅 Defer 30d / ✅ Done** buttons.
 
 Assuming you clone the repository into ~/notetaker with
 ```bash
@@ -212,19 +222,27 @@ double-check that `credentials.json` and `token.json` are in `~/notetaker/`.
 
 ## 8. Set up cron jobs
 
-The bot runs via two cron entries: one that keeps it alive (checks every 5 minutes),
-and one that fires the daily summary at 08:00.
-
 ```bash
 crontab -e
 ```
 
-Add these two lines, replacing `YOUR_LINUX_USER` with your actual username:
+Add these lines, replacing `YOUR_LINUX_USER` with your actual username:
 
 ```
+# Keep bot alive (restart if down)
 */5 * * * * /home/YOUR_LINUX_USER/notetaker/keepalive.sh >> /home/konstip/notetaker/logs/keepalive.log 2>&1
 
+# Morning summary at 08:00
 0 8 * * * set -a; source /home/YOUR_LINUX_USER/notetaker/.env; set +a; /home/YOUR_LINUX_USER/notetaker/venv/bin/python /home/YOUR_LINUX_USER/notetaker/scheduler.py >> /home/konstip/notetaker/logs/notetaker_cron.log 2>&1
+
+# Per-minute reminder check
+* * * * * set -a; source /home/YOUR_LINUX_USER/notetaker/.env; set +a; /home/YOUR_LINUX_USER/notetaker/venv/bin/python /home/YOUR_LINUX_USER/notetaker/reminder_check.py >> /home/konstip/notetaker/logs/reminders.log 2>&1
+
+# Evening check-in at 20:00
+0 20 * * * set -a; source /home/YOUR_LINUX_USER/notetaker/.env; set +a; /home/YOUR_LINUX_USER/notetaker/venv/bin/python /home/YOUR_LINUX_USER/notetaker/evening.py >> /home/konstip/notetaker/logs/evening.log 2>&1
+
+# Sunday 18:00 weekly review
+0 18 * * 0 set -a; source /home/YOUR_LINUX_USER/notetaker/.env; set +a; /home/YOUR_LINUX_USER/notetaker/venv/bin/python /home/YOUR_LINUX_USER/notetaker/weekly_review.py >> /home/konstip/notetaker/logs/weekly.log 2>&1
 ```
 
 ## 9. Verify everything works

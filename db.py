@@ -32,7 +32,11 @@ def init_db():
                     is_done BOOLEAN DEFAULT FALSE,
                     is_priority BOOLEAN NOT NULL DEFAULT FALSE,
                     notion_page_id VARCHAR(36) NULL DEFAULT NULL,
-                    notion_synced_at DATETIME NULL DEFAULT NULL
+                    notion_synced_at DATETIME NULL DEFAULT NULL,
+                    recurrence VARCHAR(40) NULL DEFAULT NULL,
+                    remind_at DATETIME NULL DEFAULT NULL,
+                    remind_sent BOOLEAN NOT NULL DEFAULT FALSE,
+                    source_event_id VARCHAR(255) NULL DEFAULT NULL
                 ) CHARACTER SET utf8mb4
             """)
             # Migrate existing installations
@@ -40,7 +44,11 @@ def init_db():
                 ALTER TABLE tasks
                     ADD COLUMN IF NOT EXISTS notion_page_id VARCHAR(36) NULL DEFAULT NULL,
                     ADD COLUMN IF NOT EXISTS notion_synced_at DATETIME NULL DEFAULT NULL,
-                    ADD COLUMN IF NOT EXISTS is_priority BOOLEAN NOT NULL DEFAULT FALSE
+                    ADD COLUMN IF NOT EXISTS is_priority BOOLEAN NOT NULL DEFAULT FALSE,
+                    ADD COLUMN IF NOT EXISTS recurrence VARCHAR(40) NULL DEFAULT NULL,
+                    ADD COLUMN IF NOT EXISTS remind_at DATETIME NULL DEFAULT NULL,
+                    ADD COLUMN IF NOT EXISTS remind_sent BOOLEAN NOT NULL DEFAULT FALSE,
+                    ADD COLUMN IF NOT EXISTS source_event_id VARCHAR(255) NULL DEFAULT NULL
             """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS attachments (
@@ -60,13 +68,18 @@ def init_db():
 
 
 def add_task(raw_text: str, title: str, category: str, due_date: date | None,
-             is_priority: bool = False) -> int:
+             is_priority: bool = False,
+             recurrence: str | None = None,
+             remind_at: datetime | None = None,
+             source_event_id: str | None = None) -> int:
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO tasks (raw_text, title, category, due_date, is_priority) "
-                "VALUES (%s, %s, %s, %s, %s)",
-                (raw_text, title, category, due_date, bool(is_priority)),
+                "INSERT INTO tasks (raw_text, title, category, due_date, is_priority, "
+                "recurrence, remind_at, source_event_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (raw_text, title, category, due_date, bool(is_priority),
+                 recurrence, remind_at, source_event_id),
             )
             return conn.insert_id()
 
@@ -77,6 +90,7 @@ def _select_open_tasks_sql(extra_where: str = "", order: str | None = None) -> s
         SELECT t.id, t.title, t.category, t.due_date, t.created_at,
                t.is_priority, t.is_done, t.done_at, t.raw_text,
                t.notion_page_id, t.notion_synced_at,
+               t.recurrence, t.remind_at, t.remind_sent, t.source_event_id,
                COALESCE(a.cnt, 0) AS attachment_count
         FROM tasks t
         LEFT JOIN (
@@ -145,14 +159,163 @@ def get_summary_tasks() -> dict:
     return {"overdue": overdue, "upcoming": upcoming, "old_noduedate": old_noduedate}
 
 
+_WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def compute_next_due(recurrence: str, base: date) -> date | None:
+    """Given a recurrence string and a base date, return the next due date (after base).
+    Recognized formats: 'daily', 'weekday', 'weekly:<mon|tue|...>', 'monthly:<1-31>'.
+    Returns None if the string can't be parsed."""
+    rec = (recurrence or "").strip().lower()
+    if not rec:
+        return None
+    if rec == "daily":
+        return base + timedelta(days=1)
+    if rec == "weekday":
+        d = base + timedelta(days=1)
+        while d.weekday() >= 5:  # 5=Sat, 6=Sun
+            d += timedelta(days=1)
+        return d
+    if rec.startswith("weekly:"):
+        wd = rec.split(":", 1)[1].strip()[:3]
+        if wd not in _WEEKDAYS:
+            return None
+        target = _WEEKDAYS.index(wd)
+        d = base + timedelta(days=1)
+        while d.weekday() != target:
+            d += timedelta(days=1)
+        return d
+    if rec.startswith("monthly:"):
+        try:
+            day = int(rec.split(":", 1)[1])
+        except ValueError:
+            return None
+        if not 1 <= day <= 31:
+            return None
+        # Walk forward day-by-day to land on the first matching day-of-month after base.
+        d = base + timedelta(days=1)
+        for _ in range(366):
+            if d.day == day:
+                return d
+            d += timedelta(days=1)
+        return None
+    return None
+
+
 def mark_done(task_id: int) -> bool:
+    """Mark a task done. If it's recurring, also spawn the next instance.
+    Returns True if the original task transitioned from open to done."""
+    transitioned, _ = mark_done_ex(task_id)
+    return transitioned
+
+
+def mark_done_ex(task_id: int) -> tuple[bool, int | None]:
+    """Like mark_done but also returns the spawned next-instance task ID
+    when the completed task was recurring."""
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE tasks SET is_done = TRUE, done_at = %s WHERE id = %s AND is_done = FALSE",
                 (datetime.now(), task_id),
             )
+            if cur.rowcount == 0:
+                return False, None
+            cur.execute(
+                "SELECT raw_text, title, category, due_date, is_priority, recurrence "
+                "FROM tasks WHERE id = %s",
+                (task_id,),
+            )
+            row = cur.fetchone()
+    if not row or not row.get("recurrence"):
+        return True, None
+
+    base = row.get("due_date")
+    if isinstance(base, datetime):
+        base = base.date()
+    if base is None:
+        base = date.today()
+    next_due = compute_next_due(row["recurrence"], base)
+    if next_due is None:
+        return True, None
+    new_id = add_task(
+        raw_text=row["raw_text"],
+        title=row["title"],
+        category=row["category"],
+        due_date=next_due,
+        is_priority=bool(row.get("is_priority")),
+        recurrence=row["recurrence"],
+    )
+    return True, new_id
+
+
+def get_due_reminders() -> list[dict]:
+    """Return open tasks with remind_at <= NOW and remind_sent = FALSE."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, title, category, due_date, is_priority, remind_at, recurrence
+                FROM tasks
+                WHERE is_done = FALSE
+                  AND remind_at IS NOT NULL
+                  AND remind_sent = FALSE
+                  AND remind_at <= NOW()
+                ORDER BY remind_at ASC
+            """)
+            return cur.fetchall()
+
+
+def mark_reminder_sent(task_id: int) -> bool:
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE tasks SET remind_sent = TRUE WHERE id = %s",
+                (task_id,),
+            )
             return cur.rowcount > 0
+
+
+def get_task_by_event_id(event_id: str) -> dict | None:
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, title, due_date, is_done FROM tasks WHERE source_event_id = %s LIMIT 1",
+                (event_id,),
+            )
+            return cur.fetchone()
+
+
+def get_open_tasks_due_today() -> list[dict]:
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(_select_open_tasks_sql("t.due_date = CURDATE()"))
+            return cur.fetchall()
+
+
+def get_oldest_open_tasks(limit: int = 5) -> list[dict]:
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                _select_open_tasks_sql(
+                    order="t.created_at ASC",
+                ) + " LIMIT %s",
+                (int(limit),),
+            )
+            return cur.fetchall()
+
+
+def get_done_stats_by_category(days: int) -> list[dict]:
+    """Done counts grouped by category over the last N days."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT category, COUNT(*) AS done
+                FROM tasks
+                WHERE is_done = TRUE
+                  AND done_at >= NOW() - INTERVAL %s DAY
+                GROUP BY category
+                ORDER BY done DESC
+            """, (int(days),))
+            return cur.fetchall()
 
 
 def mark_open(task_id: int) -> bool:
@@ -188,7 +351,8 @@ def get_task(task_id: int) -> dict | None:
 
 
 def update_task(task_id: int, **fields) -> bool:
-    allowed = {"title", "category", "due_date", "is_priority"}
+    allowed = {"title", "category", "due_date", "is_priority",
+               "recurrence", "remind_at", "remind_sent"}
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return False

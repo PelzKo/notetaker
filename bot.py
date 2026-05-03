@@ -23,6 +23,8 @@ import config
 import db
 import claude_client
 import notion
+import url_capture
+import google_calendar
 from formatting import (
     CATEGORY_EMOJI,
     build_task_list,
@@ -82,7 +84,7 @@ def _edit_button(task_id: int) -> InlineKeyboardMarkup:
     )
 
 
-def _category_picker_markup(task_id: int) -> InlineKeyboardMarkup:
+def _category_picker_rows(task_id: int) -> list[list[InlineKeyboardButton]]:
     cats = [c for c in config.CATEGORIES if c != "Unknown"]
     rows: list[list[InlineKeyboardButton]] = []
     for i in range(0, len(cats), 4):
@@ -93,6 +95,27 @@ def _category_picker_markup(task_id: int) -> InlineKeyboardMarkup:
             )
             for c in cats[i:i + 4]
         ])
+    return rows
+
+
+def _capture_action_rows(task_id: int, *, is_priority: bool = False) -> list[list[InlineKeyboardButton]]:
+    star = "⭐" if is_priority else "☆"
+    return [
+        [
+            InlineKeyboardButton(f"{star} Priority", callback_data=f"act:{task_id}:pri"),
+            InlineKeyboardButton("📅 Today", callback_data=f"act:{task_id}:today"),
+            InlineKeyboardButton("📅 Tomorrow", callback_data=f"act:{task_id}:tomorrow"),
+        ],
+        [
+            InlineKeyboardButton("➕1d", callback_data=f"act:{task_id}:defer1"),
+            InlineKeyboardButton(f"✏️ /edit {task_id}", callback_data=f"edit:{task_id}"),
+            InlineKeyboardButton("❌ Drop", callback_data=f"act:{task_id}:drop"),
+        ],
+    ]
+
+
+def _category_picker_markup(task_id: int) -> InlineKeyboardMarkup:
+    rows = _category_picker_rows(task_id)
     rows.append([InlineKeyboardButton(f"✏️ /edit {task_id}", callback_data=f"edit:{task_id}")])
     return InlineKeyboardMarkup(rows)
 
@@ -132,8 +155,9 @@ def _parse_date_keyword(s: str) -> tuple[bool, date | None]:
 # Shared "added" reply renderer
 # ---------------------------------------------------------------------------
 
-async def _send_added_reply(send_fn, task: dict, *, parse_error: str | None = None,
-                            attachment_count: int = 0, prefix: str = "✅ Added"):
+def _render_added_card(task: dict, *, parse_error: str | None = None,
+                       attachment_count: int = 0,
+                       prefix: str = "✅ Added") -> tuple[str, InlineKeyboardMarkup | None]:
     emoji = CATEGORY_EMOJI.get(task["category"], "📌")
     lines = [
         f"{prefix} (#{task['id']}):",
@@ -143,17 +167,34 @@ async def _send_added_reply(send_fn, task: dict, *, parse_error: str | None = No
     if task.get("is_priority"):
         lines.append("⭐ priority")
     lines.append(f"📅 {fmt_date(task.get('due_date'))}")
+    if task.get("recurrence"):
+        lines.append(f"🔁 {task['recurrence']}")
+    if task.get("remind_at"):
+        ra = task["remind_at"]
+        if isinstance(ra, datetime):
+            lines.append(f"⏰ {ra.strftime('%Y-%m-%d %H:%M')}")
+        else:
+            lines.append(f"⏰ {ra}")
     if attachment_count == 1:
         lines.append("📎 1 attachment")
     elif attachment_count > 1:
         lines.append(f"📎 {attachment_count} attachments")
     if parse_error:
         lines.append(f"\n⚠️ Parse warning: {parse_error}")
-    reply_markup = None
+    rows: list[list[InlineKeyboardButton]] = []
     if task["category"] == "Unknown":
         lines.append(f"\n❓ Couldn't detect category — tap below or use /edit {task['id']}.")
-        reply_markup = _category_picker_markup(task["id"])
-    await send_fn("\n".join(lines), reply_markup=reply_markup)
+        rows.extend(_category_picker_rows(task["id"]))
+    rows.extend(_capture_action_rows(task["id"], is_priority=bool(task.get("is_priority"))))
+    return "\n".join(lines), InlineKeyboardMarkup(rows) if rows else None
+
+
+async def _send_added_reply(send_fn, task: dict, *, parse_error: str | None = None,
+                            attachment_count: int = 0, prefix: str = "✅ Added"):
+    text, markup = _render_added_card(
+        task, parse_error=parse_error, attachment_count=attachment_count, prefix=prefix,
+    )
+    await send_fn(text, reply_markup=markup)
 
 
 # ---------------------------------------------------------------------------
@@ -184,17 +225,38 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _handle_done_reply(update, ctx, raw)
         return
 
-    await update.message.reply_text("⏳ Parsing…")
+    # URL-only message → fetch the page title for a cleaner parse input
+    parse_input = raw
+    url_only = url_capture.detect_url_only(raw)
+    if url_only:
+        await update.message.reply_text("⏳ Fetching link…")
+        title = url_capture.fetch_title(url_only)
+        if title:
+            parse_input = f"Read: {title}\n{url_only}"
+    elif update.message.forward_origin is not None:
+        # Forwarded message → tell Claude this is a captured/saved item, not a personal todo
+        parse_input = f"(forwarded message) {raw}"
+        await update.message.reply_text("⏳ Parsing…")
+    else:
+        await update.message.reply_text("⏳ Parsing…")
 
-    parsed = claude_client.parse_task(raw)
+    parsed = claude_client.parse_task(parse_input)
     title = parsed["title"]
     category = parsed["category"]
     due_date_str = parsed.get("due_date")
     due_date = date.fromisoformat(due_date_str) if due_date_str else None
     is_priority = bool(parsed.get("is_priority", False))
     parse_error = parsed.get("error")
+    recurrence = parsed.get("recurrence")
+    remind_at_str = parsed.get("remind_at")
+    remind_at = datetime.strptime(remind_at_str, "%Y-%m-%d %H:%M") if remind_at_str else None
 
-    task_id = db.add_task(raw, title, category, due_date, is_priority=is_priority)
+    task_id = db.add_task(
+        raw, title, category, due_date,
+        is_priority=is_priority,
+        recurrence=recurrence,
+        remind_at=remind_at,
+    )
     _sync_task_to_notion(task_id)
 
     task = db.get_task(task_id)
@@ -428,12 +490,16 @@ async def handle_edit_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Re-parsing…")
     parsed = claude_client.parse_task(text)
     due_date = date.fromisoformat(parsed["due_date"]) if parsed.get("due_date") else None
+    remind_at_str = parsed.get("remind_at")
+    remind_at = datetime.strptime(remind_at_str, "%Y-%m-%d %H:%M") if remind_at_str else None
     db.update_task(
         task_id,
         title=parsed["title"],
         category=parsed["category"],
         due_date=due_date,
         is_priority=bool(parsed.get("is_priority", False)),
+        recurrence=parsed.get("recurrence"),
+        remind_at=remind_at,
     )
     _sync_task_to_notion(task_id)
 
@@ -481,6 +547,149 @@ async def cmd_defer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 # /priority <id> [on|off]
 # ---------------------------------------------------------------------------
+
+_SNOOZE_WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def _parse_snooze_duration(spec: str) -> datetime | None:
+    s = spec.strip().lower()
+    if not s:
+        return None
+    now = datetime.now()
+    # 1h, 2h, 30m, 90m
+    if s.endswith("h"):
+        try:
+            return now + timedelta(hours=int(s[:-1]))
+        except ValueError:
+            return None
+    if s.endswith("m"):
+        try:
+            return now + timedelta(minutes=int(s[:-1]))
+        except ValueError:
+            return None
+    if s == "tomorrow":
+        return datetime.combine(date.today() + timedelta(days=1),
+                                datetime.min.time().replace(hour=8))
+    if s in _SNOOZE_WEEKDAYS:
+        target = _SNOOZE_WEEKDAYS.index(s)
+        d = date.today() + timedelta(days=1)
+        while d.weekday() != target:
+            d += timedelta(days=1)
+        return datetime.combine(d, datetime.min.time().replace(hour=8))
+    return None
+
+
+async def cmd_snooze(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+    args = ctx.args or []
+    if len(args) < 2 or not args[0].isdigit():
+        await update.message.reply_text(
+            "Usage: /snooze <task_id> <1h|30m|tomorrow|mon|tue|...>"
+        )
+        return
+    task_id = int(args[0])
+    new_remind = _parse_snooze_duration(args[1])
+    if new_remind is None:
+        await update.message.reply_text(
+            "Couldn't parse duration. Try: 1h, 30m, tomorrow, mon, fri."
+        )
+        return
+    task = db.get_task(task_id)
+    if not task:
+        await update.message.reply_text(f"Task #{task_id} not found.")
+        return
+    db.update_task(task_id, remind_at=new_remind, remind_sent=False)
+    await update.message.reply_text(
+        f"💤 Snoozed #{task_id} until {new_remind.strftime('%a %d %b %H:%M')}."
+    )
+
+
+def _currently_in_meeting(events: dict) -> dict | None:
+    """If the user is in a timed event right now, return that event."""
+    now = datetime.now()
+    today_str = date.today().strftime("%H:%M")
+    for e in events.get("today", []):
+        if e["all_day"] or not e.get("end"):
+            continue
+        try:
+            start = datetime.combine(date.today(), datetime.strptime(e["start"], "%H:%M").time())
+            end = datetime.combine(date.today(), datetime.strptime(e["end"], "%H:%M").time())
+        except ValueError:
+            continue
+        if start <= now <= end:
+            return e
+    return None
+
+
+def _score_task(task: dict) -> float:
+    today = date.today()
+    due = task.get("due_date")
+    if isinstance(due, datetime):
+        due = due.date()
+    score = 0.0
+    if task.get("is_priority"):
+        score += 100
+    if due is not None:
+        if due < today:
+            score += (today - due).days * 10
+        elif due == today:
+            score += 50
+    created = task.get("created_at")
+    if isinstance(created, datetime):
+        created_d = created.date()
+    elif isinstance(created, date):
+        created_d = created
+    else:
+        created_d = today
+    score -= (today - created_d).days * 0.5
+    return score
+
+
+def _pick_next_keyboard(task_id: int) -> InlineKeyboardMarkup:
+    rows = _capture_action_rows(task_id, is_priority=False)
+    rows.append([InlineKeyboardButton("🔁 Pick another", callback_data=f"nextagain:{task_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _format_next_card(task: dict) -> str:
+    emoji = CATEGORY_EMOJI.get(task["category"], "📌")
+    lines = [f"🎯 Up next (#{task['id']}):", f"📌 {task['title']}", f"{emoji} {task['category']}"]
+    if task.get("is_priority"):
+        lines.append("⭐ priority")
+    lines.append(f"📅 {fmt_date(task.get('due_date'))}")
+    return "\n".join(lines)
+
+
+async def cmd_next(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+    cal = google_calendar.get_events()
+    in_meeting = _currently_in_meeting(cal)
+    if in_meeting:
+        await update.message.reply_text(
+            f"📅 You're in '{in_meeting['title']}' right now "
+            f"({in_meeting['start']}–{in_meeting['end']}). I'll skip a recommendation."
+        )
+        return
+
+    tasks = db.get_open_tasks()
+    excluded: set = ctx.user_data.get("next_excluded", set())
+    candidates = [t for t in tasks if t["id"] not in excluded]
+    if not candidates:
+        ctx.user_data["next_excluded"] = set()  # reset
+        await update.message.reply_text("Nothing left to suggest. /list to see everything open.")
+        return
+
+    pick = max(candidates, key=_score_task)
+    excluded = set(excluded)
+    excluded.add(pick["id"])
+    ctx.user_data["next_excluded"] = excluded
+    await update.message.reply_text(
+        _format_next_card(pick),
+        reply_markup=_pick_next_keyboard(pick["id"]),
+    )
+
 
 async def cmd_priority(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
@@ -693,6 +902,8 @@ HELP_TEXT = (
     "/edit <id> <field> <value> — set title|category|date|priority\n"
     "/defer <id> [days] — push due date back (default 1)\n"
     "/priority <id> [on|off] — toggle ⭐\n"
+    "/snooze <id> <1h|30m|tomorrow|mon> — push reminder forward\n"
+    "/next — suggest what to do right now\n"
     "/drop <id> — delete\n\n"
     "Notion\n"
     "/sync — pull changes from Notion\n"
@@ -805,7 +1016,14 @@ def _create_task_for_caption(caption: str | None) -> tuple[int, str | None, str]
         due_str = parsed.get("due_date")
         due_date = date.fromisoformat(due_str) if due_str else None
         is_priority = bool(parsed.get("is_priority", False))
-        task_id = db.add_task(raw, title, category, due_date, is_priority=is_priority)
+        remind_at_str = parsed.get("remind_at")
+        remind_at = datetime.strptime(remind_at_str, "%Y-%m-%d %H:%M") if remind_at_str else None
+        task_id = db.add_task(
+            raw, title, category, due_date,
+            is_priority=is_priority,
+            recurrence=parsed.get("recurrence"),
+            remind_at=remind_at,
+        )
         return task_id, parsed.get("error"), raw
     task_id = db.add_task("📎 (attachment)", "📎 Untitled attachment", "Unknown", None, is_priority=False)
     return task_id, None, "📎 (attachment)"
@@ -816,12 +1034,16 @@ def _update_task_from_caption(task_id: int, caption: str) -> str | None:
     parsed = claude_client.parse_task(caption.strip())
     due_str = parsed.get("due_date")
     due_date = date.fromisoformat(due_str) if due_str else None
+    remind_at_str = parsed.get("remind_at")
+    remind_at = datetime.strptime(remind_at_str, "%Y-%m-%d %H:%M") if remind_at_str else None
     db.update_task(
         task_id,
         title=parsed["title"],
         category=parsed["category"],
         due_date=due_date,
         is_priority=bool(parsed.get("is_priority", False)),
+        recurrence=parsed.get("recurrence"),
+        remind_at=remind_at,
     )
     return parsed.get("error")
 
@@ -961,20 +1183,91 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not task:
             await query.message.reply_text(f"Task #{task_id} not found.")
             return
-        emoji = CATEGORY_EMOJI.get(cat, "📌")
-        lines = [
-            f"✅ Updated (#{task_id}):",
-            f"📌 {task['title']}",
-            f"{emoji} {task['category']}",
-        ]
-        if task.get("is_priority"):
-            lines.append("⭐ priority")
-        lines.append(f"📅 {fmt_date(task['due_date'])}")
+        text, markup = _render_added_card(
+            task,
+            attachment_count=int(task.get("attachment_count") or 0),
+            prefix="✅ Updated",
+        )
         try:
-            await query.edit_message_text("\n".join(lines), reply_markup=_edit_button(task_id))
+            await query.edit_message_text(text, reply_markup=markup)
         except Exception as e:  # noqa: BLE001
             log.warning("edit_message_text (setcat) failed: %s", e)
-            await query.message.reply_text("\n".join(lines), reply_markup=_edit_button(task_id))
+            await query.message.reply_text(text, reply_markup=markup)
+        return
+
+    if data.startswith("act:"):
+        _, raw_id, action = data.split(":", 2)
+        task_id = int(raw_id)
+        task = db.get_task(task_id)
+        if not task:
+            await query.message.reply_text(f"Task #{task_id} not found.")
+            return
+
+        if action == "drop":
+            page_id = task.get("notion_page_id")
+            db.delete_task(task_id)
+            _archive_task_in_notion(page_id)
+            text = f"🗑 Deleted #{task_id}: {task['title']}"
+            try:
+                await query.edit_message_text(text)
+            except Exception as e:  # noqa: BLE001
+                log.warning("edit_message_text (act:drop) failed: %s", e)
+                await query.message.reply_text(text)
+            return
+
+        if action == "done":
+            if db.mark_done(task_id):
+                _sync_task_to_notion(task_id)
+                text = f"✅ Done #{task_id}: {task['title']}"
+            else:
+                text = f"Task #{task_id} was already done."
+            try:
+                await query.edit_message_text(text)
+            except Exception as e:  # noqa: BLE001
+                log.warning("edit_message_text (act:done) failed: %s", e)
+                await query.message.reply_text(text)
+            return
+
+        if action == "pri":
+            db.set_priority(task_id, not bool(task.get("is_priority")))
+        elif action == "today":
+            db.update_task(task_id, due_date=date.today())
+        elif action == "tomorrow":
+            db.update_task(task_id, due_date=date.today() + timedelta(days=1))
+        elif action.startswith("defer"):
+            try:
+                days = int(action[len("defer"):]) or 1
+            except ValueError:
+                days = 1
+            db.defer_task(task_id, days)
+        elif action == "snz1h":
+            db.update_task(
+                task_id,
+                remind_at=datetime.now() + timedelta(hours=1),
+                remind_sent=False,
+            )
+        elif action == "snzAM":
+            tomorrow_8 = datetime.combine(date.today() + timedelta(days=1),
+                                          datetime.min.time().replace(hour=8))
+            db.update_task(task_id, remind_at=tomorrow_8, remind_sent=False)
+        else:
+            await query.message.reply_text(f"Unknown action: {action}")
+            return
+
+        _sync_task_to_notion(task_id)
+        new_task = db.get_task(task_id)
+        if not new_task:
+            return
+        text, markup = _render_added_card(
+            new_task,
+            attachment_count=int(new_task.get("attachment_count") or 0),
+            prefix="✅ Updated",
+        )
+        try:
+            await query.edit_message_text(text, reply_markup=markup)
+        except Exception as e:  # noqa: BLE001
+            log.warning("edit_message_text (act) failed: %s", e)
+            await query.message.reply_text(text, reply_markup=markup)
         return
 
     if data.startswith("undo:"):
@@ -996,6 +1289,35 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:  # noqa: BLE001
             log.warning("edit_message_text (undo) failed: %s", e)
             await query.message.reply_text(text)
+        return
+
+    if data.startswith("nextagain:"):
+        prev = int(data.split(":", 1)[1])
+        excluded = set(ctx.user_data.get("next_excluded", set()))
+        excluded.add(prev)
+        tasks = db.get_open_tasks()
+        candidates = [t for t in tasks if t["id"] not in excluded]
+        if not candidates:
+            ctx.user_data["next_excluded"] = set()
+            try:
+                await query.edit_message_text("Nothing left to suggest. /list to see everything.")
+            except Exception:  # noqa: BLE001
+                await query.message.reply_text("Nothing left to suggest.")
+            return
+        pick = max(candidates, key=_score_task)
+        excluded.add(pick["id"])
+        ctx.user_data["next_excluded"] = excluded
+        try:
+            await query.edit_message_text(
+                _format_next_card(pick),
+                reply_markup=_pick_next_keyboard(pick["id"]),
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("edit_message_text (nextagain) failed: %s", e)
+            await query.message.reply_text(
+                _format_next_card(pick),
+                reply_markup=_pick_next_keyboard(pick["id"]),
+            )
         return
 
     if data.startswith("filter:"):
@@ -1047,6 +1369,8 @@ async def _post_init(app):
         BotCommand("edit", "Edit a task"),
         BotCommand("defer", "Push due date later"),
         BotCommand("priority", "Toggle ⭐ priority"),
+        BotCommand("snooze", "Snooze a reminder"),
+        BotCommand("next", "Suggest what to do right now"),
         BotCommand("drop", "Delete a task"),
         BotCommand("stats", "Counts per category"),
         BotCommand("sync", "Pull from Notion"),
@@ -1084,6 +1408,8 @@ def main():
     app.add_handler(CommandHandler("show", cmd_show))
     app.add_handler(CommandHandler("defer", cmd_defer))
     app.add_handler(CommandHandler("priority", cmd_priority))
+    app.add_handler(CommandHandler("snooze", cmd_snooze))
+    app.add_handler(CommandHandler("next", cmd_next))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
