@@ -32,9 +32,8 @@ def build_summary() -> tuple[str, list[dict]]:
             return
         sections.append(header)
         for t in task_list:
-            idx = len(all_tasks) + 1
             all_tasks.append(t)
-            sections.append(fmt_task_line(idx, t))
+            sections.append(fmt_task_line(t))
         sections.append("")
  
     add_section("⚠️ OVERDUE:", tasks["overdue"])
@@ -63,10 +62,10 @@ def build_summary() -> tuple[str, list[dict]]:
 def build_done_prompt(tasks: list[dict]) -> str:
     if not tasks:
         return ""
-    lines = ["Mark done? Reply with numbers (e.g. '1 3'):\n"]
-    for i, t in enumerate(tasks, 1):
+    lines = ["Mark done? Reply with task IDs (e.g. '42 17'):\n"]
+    for t in tasks:
         emoji = CATEGORY_EMOJI.get(t["category"], "📌")
-        lines.append(f"{i}. {emoji} {t['title']}")
+        lines.append(f"• {emoji} {t['title']} #{t['id']}")
     return "\n".join(lines)
 
 

@@ -2,21 +2,22 @@
 
 | Command | Action |
 |---------|--------|
-| /list | Show all open tasks, numbered, with mark-done prompt |
+| /list | Show all open tasks, numbered; reply with IDs to mark done |
 | /list onlytext | Compact bullet list (no emojis or dates) — IDs only |
+| /listtext | Same compact output as `/list onlytext` (no mark-done session) |
 | /show &lt;id&gt; | Show full task detail and re-send any attachments |
 | /search &lt;query&gt; | Find open tasks whose title or original text contains the query |
 | /filter [category] | Filter open tasks by category (no arg → category picker buttons) |
 | /history [days] | List tasks completed in the last N days (default 7), grouped by date |
-| /done | Show numbered list to pick from (same as after summary) |
+| /done | Show numbered open task list; reply with IDs to mark done |
 | /edit &lt;id&gt; | Bot asks what to change (free-text re-parse mode) |
-| /edit &lt;id&gt; &lt;field&gt; &lt;value&gt; | Set a single field: `title`, `category`, `date`, `priority` |
+| /edit &lt;id&gt; &lt;field&gt; &lt;value&gt; | Set a single field: `title`, `category`, `date`/`due`, `priority` |
 | /defer &lt;id&gt; [days] | Push the due date later by N days (default 1) |
 | /priority &lt;id&gt; [on\|off] | Toggle ⭐ priority (no arg → toggle) |
 | /snooze &lt;id&gt; &lt;1h\|30m\|tomorrow\|mon&gt; | Push a reminder forward |
 | /next | Suggest one task to do right now (skips if you're in a meeting) |
 | /drop &lt;id&gt; | Delete a task permanently |
-| /stats | Quick counts per category |
+| /stats | Quick counts per category (open and done) |
 | /sync | Pull any Notion changes into MariaDB on demand |
 | /pushnotion [all] | Push every DB task missing a Notion page to Notion (open only by default) |
 | /menu | Show a persistent reply keyboard with the most-used commands |
@@ -37,12 +38,14 @@
 
 ### Inline buttons
 
-- Every freshly captured task comes with **⭐ Priority / 📅 Today / 📅 Tomorrow / +1d / ✏️ /edit / ❌ Drop** buttons.
+- Every freshly captured task comes with **⭐ Priority / 📅 Today / 📅 Tomorrow / ➕1d / ✏️ /edit / ❌ Drop** buttons.
 - After `/done`, an **↩️ Undo** button lets you re-open the most recently completed tasks.
 - New tasks parsed as `Unknown` come with quick-pick category buttons.
 - `/filter` with no argument shows a one-tap category picker.
 - Reminders sent by `reminder_check.py` come with **✅ Done / 💤 Snooze 1h / 🌅 Tomorrow AM** buttons.
 - The Sunday weekly review surfaces stale tasks with **❌ Drop / 📅 Defer 30d / ✅ Done** buttons.
+- The evening check-in surfaces open tasks due today with **✅ Done / 📅 Tomorrow / +1d** buttons.
+- `/next` suggestion cards include a **🔁 Pick another** button to cycle through candidates without repeating.
 
 Assuming you clone the repository into ~/notetaker with
 ```bash
@@ -152,16 +155,17 @@ When configured, every task you add/edit/complete/delete is mirrored to a Notion
 
 Create a new **full-page database** in Notion (not an inline/embedded one — it must be its own page so it has its own URL). Add exactly these properties with these exact names and types:
 
-| Property name | Type   | Notes |
-|---------------|--------|-------|
-| `Name`        | Title  | Built-in, already exists |
-| `Category`    | Select | Add options: `Work`, `Home`, `MCM`, `YFU`, `Personal`, `Other`, `Unknown` |
-| `Due Date`    | Date   | |
-| `Done`        | Checkbox | |
-| `Done At`     | Date   | |
-| `Task ID`     | Number | Used to link Notion pages back to MariaDB rows |
-| `Priority`    | Checkbox | Optional. ⭐ flag synced both ways; bot skips it gracefully if you don't add it |
-| `Attachment`  | Checkbox | Optional. Set automatically when a task has Telegram attachments (read-only, files stay in Telegram) |
+| Property name | Type      | Notes |
+|---------------|-----------|-------|
+| `Name`        | Title     | Built-in, already exists |
+| `Category`    | Select    | Add options: `Work`, `Home`, `MCM`, `YFU`, `Personal`, `Other`, `Unknown` |
+| `Due Date`    | Date      | |
+| `Done`        | Checkbox  | |
+| `Done At`     | Date      | |
+| `Task ID`     | Number    | Used to link Notion pages back to MariaDB rows |
+| `Priority`    | Checkbox  | Optional. ⭐ flag synced both ways; bot skips it gracefully if absent |
+| `Attachment`  | Checkbox  | Optional. Set automatically when a task has Telegram attachments (read-only, files stay in Telegram) |
+| `Recurrence`  | Rich Text | Optional. Shows the recurrence rule (e.g. `weekly:mon`, `daily`); read-only in Notion |
 
 ### 5c. Get the database ID
 
@@ -230,19 +234,19 @@ Add these lines, replacing `YOUR_LINUX_USER` with your actual username:
 
 ```
 # Keep bot alive (restart if down)
-*/5 * * * * /home/YOUR_LINUX_USER/notetaker/keepalive.sh >> /home/konstip/notetaker/logs/keepalive.log 2>&1
+*/5 * * * * /home/YOUR_LINUX_USER/notetaker/keepalive.sh >> /home/YOUR_LINUX_USER/notetaker/logs/keepalive.log 2>&1
 
-# Morning summary at 08:00
-0 8 * * * set -a; source /home/YOUR_LINUX_USER/notetaker/.env; set +a; /home/YOUR_LINUX_USER/notetaker/venv/bin/python /home/YOUR_LINUX_USER/notetaker/scheduler.py >> /home/konstip/notetaker/logs/notetaker_cron.log 2>&1
+# Morning summary at 08:00 (Notion sync + calendar + task digest + interesting reads)
+0 8 * * * set -a; source /home/YOUR_LINUX_USER/notetaker/.env; set +a; /home/YOUR_LINUX_USER/notetaker/venv/bin/python /home/YOUR_LINUX_USER/notetaker/scheduler.py >> /home/YOUR_LINUX_USER/notetaker/logs/notetaker_cron.log 2>&1
 
 # Per-minute reminder check
-* * * * * set -a; source /home/YOUR_LINUX_USER/notetaker/.env; set +a; /home/YOUR_LINUX_USER/notetaker/venv/bin/python /home/YOUR_LINUX_USER/notetaker/reminder_check.py >> /home/konstip/notetaker/logs/reminders.log 2>&1
+* * * * * set -a; source /home/YOUR_LINUX_USER/notetaker/.env; set +a; /home/YOUR_LINUX_USER/notetaker/venv/bin/python /home/YOUR_LINUX_USER/notetaker/reminder_check.py >> /home/YOUR_LINUX_USER/notetaker/logs/reminders.log 2>&1
 
-# Evening check-in at 20:00
-0 20 * * * set -a; source /home/YOUR_LINUX_USER/notetaker/.env; set +a; /home/YOUR_LINUX_USER/notetaker/venv/bin/python /home/YOUR_LINUX_USER/notetaker/evening.py >> /home/konstip/notetaker/logs/evening.log 2>&1
+# Evening check-in at 20:00 (today's done, open tasks, tomorrow's calendar, auto-prep tasks)
+0 20 * * * set -a; source /home/YOUR_LINUX_USER/notetaker/.env; set +a; /home/YOUR_LINUX_USER/notetaker/venv/bin/python /home/YOUR_LINUX_USER/notetaker/evening.py >> /home/YOUR_LINUX_USER/notetaker/logs/evening.log 2>&1
 
 # Sunday 18:00 weekly review
-0 18 * * 0 set -a; source /home/YOUR_LINUX_USER/notetaker/.env; set +a; /home/YOUR_LINUX_USER/notetaker/venv/bin/python /home/YOUR_LINUX_USER/notetaker/weekly_review.py >> /home/konstip/notetaker/logs/weekly.log 2>&1
+0 18 * * 0 set -a; source /home/YOUR_LINUX_USER/notetaker/.env; set +a; /home/YOUR_LINUX_USER/notetaker/venv/bin/python /home/YOUR_LINUX_USER/notetaker/weekly_review.py >> /home/YOUR_LINUX_USER/notetaker/logs/weekly.log 2>&1
 ```
 
 ## 9. Verify everything works
@@ -250,7 +254,7 @@ Add these lines, replacing `YOUR_LINUX_USER` with your actual username:
 ```bash
 # Check bot is running
 pgrep -f "bot.py"           # should print a PID
-tail -f /home/konstip/notetaker/logs/notetaker.log    # should show "Bot starting…"
+tail -f /home/YOUR_LINUX_USER/notetaker/logs/notetaker.log    # should show "Bot starting…"
 ```
 
 Then in Telegram:

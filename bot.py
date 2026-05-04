@@ -284,9 +284,12 @@ async def _handle_done_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tex
     for task_id in ids:
         if task_id in session_ids:
             task = session_ids[task_id]
-            if db.mark_done(task["id"]):
+            transitioned, new_id = db.mark_done_ex(task["id"])
+            if transitioned:
                 marked.append((task["id"], task["title"]))
                 _sync_task_to_notion(task["id"])
+                if new_id is not None:
+                    _sync_task_to_notion(new_id)
             else:
                 failed.append(task["title"])
         else:
@@ -1216,9 +1219,15 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         if action == "done":
-            if db.mark_done(task_id):
+            transitioned, new_id = db.mark_done_ex(task_id)
+            if transitioned:
                 _sync_task_to_notion(task_id)
-                text = f"✅ Done #{task_id}: {task['title']}"
+                if new_id is not None:
+                    _sync_task_to_notion(new_id)
+                    text = (f"✅ Done #{task_id}: {task['title']}\n"
+                            f"🔁 Next instance queued as #{new_id}.")
+                else:
+                    text = f"✅ Done #{task_id}: {task['title']}"
             else:
                 text = f"Task #{task_id} was already done."
             try:
