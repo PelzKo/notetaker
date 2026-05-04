@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 CATEGORY_EMOJI = {
     "Work": "💻",
@@ -42,11 +42,14 @@ def _badges(task: dict) -> str:
     return " ".join(parts)
 
 
-def fmt_task_line(task: dict) -> str:
+def fmt_task_line(task: dict, show_date: bool = True) -> str:
     emoji = CATEGORY_EMOJI.get(task["category"], "📌")
-    due = fmt_date(task.get("due_date"))
     badges = _badges(task)
-    line = f"• {emoji} {task['title']} #{task['id']} — {task['category']} — {due}"
+    if show_date:
+        due = fmt_date(task.get("due_date"))
+        line = f"• {emoji} {task['title']} #{task['id']} — {task['category']} — {due}"
+    else:
+        line = f"• {emoji} {task['title']} #{task['id']} — {task['category']}"
     if badges:
         line = f"{line} {badges}"
     return line
@@ -69,6 +72,63 @@ def build_task_list_simple(tasks: list[dict], header: str = "📋 Open tasks:") 
     for t in tasks:
         prio = "⭐ " if t.get("is_priority") else ""
         lines.append(f"• {prio}{t['title']} #{t['id']}")
+    return "\n".join(lines)
+
+
+def build_task_list_sectioned(
+    tasks: list[dict],
+    header: str = "📋 Open tasks:",
+    *,
+    summary_mode: bool = False,
+) -> str:
+    """Sectioned layout: Overdue / Today / Tomorrow / Due Soon.
+
+    summary_mode=True  → Due Soon = tasks due in 2–7 days (undated excluded).
+    summary_mode=False → Due Soon = tasks due in 2+ days plus undated tasks.
+    Each section is omitted when empty.
+    Today/Tomorrow lines omit the date (implicit from the header).
+    """
+    if not tasks:
+        return "✅ No open tasks."
+    today = date.today()
+    tomorrow_date = today + timedelta(days=1)
+    overdue: list[dict] = []
+    due_today: list[dict] = []
+    due_tomorrow: list[dict] = []
+    due_soon: list[dict] = []
+    for t in tasks:
+        d = t.get("due_date")
+        if isinstance(d, str):
+            d = date.fromisoformat(d)
+        if isinstance(d, datetime):
+            d = d.date()
+        if d is None:
+            if not summary_mode:
+                due_soon.append(t)
+        elif d < today:
+            overdue.append(t)
+        elif d == today:
+            due_today.append(t)
+        elif d == tomorrow_date:
+            due_tomorrow.append(t)
+        else:
+            due_soon.append(t)
+    lines = [header, ""]
+
+    def _add(label: str, section: list[dict], show_date: bool = True) -> None:
+        if not section:
+            return
+        lines.append(label)
+        for t in section:
+            lines.append(fmt_task_line(t, show_date=show_date))
+        lines.append("")
+
+    _add("⚠️ Overdue:", overdue)
+    _add("📅 Today:", due_today, show_date=False)
+    _add("📅 Tomorrow:", due_tomorrow, show_date=False)
+    _add("🗓 Due Soon:", due_soon)
+    while lines and lines[-1] == "":
+        lines.pop()
     return "\n".join(lines)
 
 

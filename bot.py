@@ -28,6 +28,7 @@ import google_calendar
 from formatting import (
     CATEGORY_EMOJI,
     build_task_list,
+    build_task_list_sectioned,
     build_task_list_simple,
     fmt_date,
     fmt_task_detail,
@@ -323,7 +324,7 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(build_task_list_simple(tasks))
         return
     ctx.user_data["task_list"] = tasks
-    msg = build_task_list(tasks)
+    msg = build_task_list_sectioned(tasks)
     if tasks:
         msg += "\n\nReply with task IDs to mark done."
     await update.message.reply_text(msg)
@@ -349,7 +350,7 @@ async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ No open tasks.")
         return
     ctx.user_data["task_list"] = tasks
-    msg = build_task_list(tasks, "Which tasks are done? Reply with task IDs:")
+    msg = build_task_list_sectioned(tasks, "Which tasks are done? Reply with task IDs:")
     await update.message.reply_text(msg)
 
 
