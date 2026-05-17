@@ -15,7 +15,7 @@ HEADERS = {
     "content-type": "application/json",
 }
 
-PARSE_SYSTEM = """You extract structured data from todo text.
+PARSE_SYSTEM_STATIC = """You extract structured data from todo text.
 
 Categories:
 - Work: HIPPIE, CoBiNet, TUM, ExBio, sysadmin, pipeline, bioinformatics
@@ -30,7 +30,7 @@ Return ONLY valid JSON, no markdown, no explanation. Only return the string and 
 {"title": "...", "category": "...", "due_date": "YYYY-MM-DD or null", "is_priority": true|false, "recurrence": "<pattern or null>", "remind_at": "YYYY-MM-DD HH:MM or null"}
 
 Title should be imperative and concise (max 80 chars).
-For due dates: interpret relative dates using today as {today}.
+For due dates: interpret relative dates using the "Today is" line from the user turn as the reference date.
 If no date is mentioned, return null.
 Set is_priority to true when the text contains explicit urgency signals such as "urgent",
 "important", "asap", "high priority", "wichtig", "dringend", "eilig", "sofort", "!". Default false.
@@ -66,7 +66,14 @@ def parse_task(raw_text: str) -> dict:
             json={
                 "model": "claude-haiku-4-5",
                 "max_tokens": 200,
-                "system": PARSE_SYSTEM.replace("{today}", today),
+                "system": [
+                    {
+                        "type": "text",
+                        "text": PARSE_SYSTEM_STATIC,
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                    {"type": "text", "text": f"Today is {today}."},
+                ],
                 "messages": [{"role": "user", "content": raw_text}],
             },
             timeout=15,
@@ -158,7 +165,13 @@ def generate_summary_comment(tasks: dict, cal_events: dict = None) -> str:
             json={
                 "model": "claude-sonnet-4-5",
                 "max_tokens": 300,
-                "system": SUMMARY_SYSTEM,
+                "system": [
+                    {
+                        "type": "text",
+                        "text": SUMMARY_SYSTEM,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
                 "messages": [{"role": "user", "content": "\n".join(lines)}],
             },
             timeout=20,

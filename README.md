@@ -97,6 +97,10 @@ then copying the resulting token to the server.
    Save and continue through the screens
 6. Add your Google account as a test user:
    OAuth consent screen → scroll to "Test users" → Add users → add your Gmail address → Save
+7. **Publish the consent screen** (important — otherwise refresh tokens expire every 7 days):
+   OAuth consent screen → "Publishing status" → click **Publish App** → confirm.
+   The `calendar.readonly` scope does not require Google verification for personal use;
+   publishing here just stops the test-user refresh-token expiry.
 
 ### 4b. One-time OAuth flow (on your LOCAL machine)
 
@@ -134,7 +138,9 @@ scp credentials.json token.json user@yourserver:~/notetaker/
 ```
 
 `token.json` refreshes itself automatically — you will not need to redo the OAuth flow
-unless you revoke access in your Google account.
+unless you revoke access in your Google account. If you ever see "Calendar token expired
+or revoked" in the daily summary, the consent screen is still in Testing mode (see step 7
+above) or access was revoked — re-run the local OAuth flow and re-copy `token.json`.
 
 ## 5. Notion sync (optional)
 

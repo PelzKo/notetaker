@@ -59,7 +59,13 @@ def _ask_claude(events: list[dict]) -> list[dict]:
             json={
                 "model": "claude-sonnet-4-5",
                 "max_tokens": 800,
-                "system": SYSTEM_PROMPT,
+                "system": [
+                    {
+                        "type": "text",
+                        "text": SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
                 "messages": [{"role": "user", "content": _meeting_payload(events)}],
             },
             timeout=20,

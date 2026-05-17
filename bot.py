@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from datetime import date, datetime, timedelta
 
 from telegram import (
@@ -41,6 +42,11 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 EDIT_FIELDS = {"title", "category", "date", "due", "priority"}
+EDIT_TTL = timedelta(minutes=10)
+
+
+def _split_ids(s: str) -> list[str]:
+    return [p for p in re.split(r"[\s,]+", s.strip()) if p]
 
 # ---------------------------------------------------------------------------
 # Auth guard — only respond to your own chat
@@ -221,8 +227,9 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     raw = update.message.text.strip()
 
-    # Numeric reply marks listed tasks done
-    if all(part.isdigit() for part in raw.split()):
+    # Numeric reply (space- or comma-separated) marks listed tasks done
+    parts = _split_ids(raw)
+    if parts and all(p.isdigit() for p in parts):
         await _handle_done_reply(update, ctx, raw)
         return
 
@@ -279,7 +286,7 @@ async def _handle_done_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tex
         return
 
     session_ids = {t["id"]: t for t in session}
-    ids = [int(x) for x in text.split() if x.isdigit()]
+    ids = [int(x) for x in _split_ids(text) if x.isdigit()]
     marked: list[tuple[int, str]] = []  # (task_id, title)
     failed: list[str] = []
     for task_id in ids:
@@ -380,7 +387,7 @@ async def cmd_drop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # /edit <id> [field value]
 # ---------------------------------------------------------------------------
 
-EDIT_WAITING = {}  # chat_id → task_id
+EDIT_WAITING: dict[int, tuple[int, datetime]] = {}  # chat_id → (task_id, started_at)
 
 
 async def _start_edit(chat_id: int, task_id: int, reply_fn) -> None:
@@ -388,7 +395,7 @@ async def _start_edit(chat_id: int, task_id: int, reply_fn) -> None:
     if not task:
         await reply_fn(f"Task #{task_id} not found.")
         return
-    EDIT_WAITING[chat_id] = task_id
+    EDIT_WAITING[chat_id] = (task_id, datetime.now())
     emoji = CATEGORY_EMOJI.get(task["category"], "📌")
     await reply_fn(
         f"Editing #{task_id}: {task['title']}\n"
@@ -479,9 +486,14 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_edit_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    task_id = EDIT_WAITING.pop(chat_id, None)
-    if task_id is None:
+    entry = EDIT_WAITING.get(chat_id)
+    if entry is None:
         return False
+    task_id, started = entry
+    if datetime.now() - started > EDIT_TTL:
+        EDIT_WAITING.pop(chat_id, None)
+        return False
+    EDIT_WAITING.pop(chat_id, None)
 
     text = update.message.text.strip()
 
@@ -1165,6 +1177,10 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     data = query.data or ""
+
+    # Any non-edit button press cancels a pending /edit waiting on this chat.
+    if not data.startswith("edit:"):
+        EDIT_WAITING.pop(query.message.chat.id, None)
 
     if data.startswith("edit:"):
         task_id = int(data.split(":", 1)[1])

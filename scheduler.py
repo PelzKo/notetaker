@@ -11,7 +11,7 @@ import db
 import google_calendar
 import notion
 import interesting_reads
-from formatting import CATEGORY_EMOJI, fmt_date, fmt_task_line, build_task_list
+from formatting import fmt_task_line
 
 
 def send_message(text: str):
@@ -19,8 +19,7 @@ def send_message(text: str):
     resp = httpx.post(url, json={"chat_id": config.TELEGRAM_CHAT_ID, "text": text}, timeout=15)
     resp.raise_for_status()
 
-def build_summary() -> tuple[str, list[dict]]:
-    """Returns (summary_text, flat_numbered_task_list)."""
+def build_summary() -> str:
     raw = db.get_summary_tasks()
     today = date.today()
     tomorrow = today + timedelta(days=1)
@@ -58,23 +57,13 @@ def build_summary() -> tuple[str, list[dict]]:
 
     if not all_tasks and not any(cal_events.get(k) for k in ("today", "tomorrow")):
         sections.append("✅ Nothing urgent and calendar is clear!")
-        return "\n".join(sections), []
+        return "\n".join(sections)
 
     reads = interesting_reads.get_interesting_reads()
     if reads:
         sections.append("Interesting reads:\n" + "\n".join(f"• {url}" for url in reads))
 
-    return "\n".join(sections), all_tasks
-
-
-def build_done_prompt(tasks: list[dict]) -> str:
-    if not tasks:
-        return ""
-    lines = ["Mark done? Reply with task IDs (e.g. '42 17'):\n"]
-    for t in tasks:
-        emoji = CATEGORY_EMOJI.get(t["category"], "📌")
-        lines.append(f"• {emoji} {t['title']} #{t['id']}")
-    return "\n".join(lines)
+    return "\n".join(sections)
 
 
 def _run_notion_sync() -> None:
@@ -90,12 +79,8 @@ def _run_notion_sync() -> None:
 def main():
     db.init_db()
     _run_notion_sync()
-    summary, tasks = build_summary()
+    summary = build_summary()
     send_message(summary)
-
-    if tasks:
-        done_prompt = build_done_prompt(tasks)
-        send_message(done_prompt)
 
 
 if __name__ == "__main__":

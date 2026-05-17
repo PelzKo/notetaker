@@ -21,6 +21,7 @@ import os
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -38,12 +39,20 @@ def _get_service():
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except RefreshError as e:
+                raise RuntimeError(
+                    "Calendar token expired or revoked — re-run "
+                    "`python google_calendar.py` locally and copy token.json "
+                    f"to the server. ({e})"
+                ) from e
+            TOKEN_FILE.write_text(creds.to_json())
         else:
             # This only runs on first-time setup (needs a browser)
             flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
             creds = flow.run_local_server(port=0)
-        TOKEN_FILE.write_text(creds.to_json())
+            TOKEN_FILE.write_text(creds.to_json())
     return build("calendar", "v3", credentials=creds)
 
 
