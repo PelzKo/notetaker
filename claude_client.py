@@ -12,6 +12,7 @@ API_URL = "https://api.anthropic.com/v1/messages"
 HEADERS = {
     "x-api-key": config.ANTHROPIC_API_KEY,
     "anthropic-version": "2023-06-01",
+    "anthropic-beta": "prompt-caching-2024-07-31",
     "content-type": "application/json",
 }
 
@@ -30,7 +31,7 @@ Return ONLY valid JSON, no markdown, no explanation. Only return the string and 
 {"title": "...", "category": "...", "due_date": "YYYY-MM-DD or null", "is_priority": true|false, "recurrence": "<pattern or null>", "remind_at": "YYYY-MM-DD HH:MM or null"}
 
 Title should be imperative and concise (max 80 chars).
-For due dates: interpret relative dates using the "Today is" line from the user turn as the reference date.
+For due dates: interpret relative dates using the "Today is" line from the system context as the reference date.
 If no date is mentioned, return null.
 Set is_priority to true when the text contains explicit urgency signals such as "urgent",
 "important", "asap", "high priority", "wichtig", "dringend", "eilig", "sofort", "!". Default false.

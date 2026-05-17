@@ -16,6 +16,7 @@ API_URL = "https://api.anthropic.com/v1/messages"
 HEADERS = {
     "x-api-key": config.ANTHROPIC_API_KEY,
     "anthropic-version": "2023-06-01",
+    "anthropic-beta": "prompt-caching-2024-07-31",
     "content-type": "application/json",
 }
 

@@ -19,6 +19,7 @@ def send_message(text: str):
     resp = httpx.post(url, json={"chat_id": config.TELEGRAM_CHAT_ID, "text": text}, timeout=15)
     resp.raise_for_status()
 
+
 def build_summary() -> str:
     raw = db.get_summary_tasks()
     today = date.today()

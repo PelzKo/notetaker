@@ -492,7 +492,8 @@ async def handle_edit_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     task_id, started = entry
     if datetime.now() - started > EDIT_TTL:
         EDIT_WAITING.pop(chat_id, None)
-        return False
+        await update.message.reply_text("⏱️ Edit session expired. Please run /edit again.")
+        return True
     EDIT_WAITING.pop(chat_id, None)
 
     text = update.message.text.strip()
