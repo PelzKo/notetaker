@@ -3,7 +3,6 @@
   - Tasks closed today
   - Open tasks still due today (with action buttons)
   - Tomorrow's calendar preview
-  - Auto-generated prep tasks for tomorrow's meetings
   - A capture prompt
 
 Cron entry:
@@ -16,7 +15,6 @@ import httpx
 import config
 import db
 import google_calendar
-import calendar_prep
 from formatting import CATEGORY_EMOJI, fmt_date
 
 
@@ -82,16 +80,6 @@ def _format_calendar_preview(events: dict) -> str:
     return "\n".join(lines)
 
 
-def _format_prep_tasks(tasks: list[dict]) -> str:
-    if not tasks:
-        return ""
-    lines = [f"🧠 Auto-prep added ({len(tasks)}):"]
-    for t in tasks:
-        emoji = CATEGORY_EMOJI.get(t["category"], "📌")
-        lines.append(f"  • {emoji} {t['title']}")
-    return "\n".join(lines)
-
-
 def main() -> None:
     db.init_db()
 
@@ -117,17 +105,6 @@ def main() -> None:
     # Each open task gets its own message so the inline keyboard targets that task.
     for t in open_today:
         _send(_format_open_today(t), reply_markup=_open_today_keyboard(t["id"]))
-
-    # Calendar prep tasks (Phase 3.4): only run if Anthropic key + tomorrow events exist
-    tomorrow_events = cal.get("tomorrow") or []
-    prep_tasks: list[dict] = []
-    if tomorrow_events and config.ANTHROPIC_API_KEY:
-        try:
-            prep_tasks = calendar_prep.generate_prep_tasks(tomorrow_events)
-        except Exception as exc:  # noqa: BLE001
-            print(f"evening: calendar_prep failed: {exc}")
-    if prep_tasks:
-        _send(_format_prep_tasks(prep_tasks))
 
     _send("📝 Anything to capture? Send a message — I'll add it to your list.")
 

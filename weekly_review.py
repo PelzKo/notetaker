@@ -82,7 +82,7 @@ def main() -> None:
     # 14+ day stale list (excluding the ones we already showed above)
     shown_ids = {t["id"] for t in oldest}
     everything = db.get_open_tasks()
-    stale_14 = [t for t in everything if _age_days(t) >= 14 and t["id"] not in shown_ids]
+    stale_14 = [t for t in everything if _age_days(t) >= 14 and not t.get("due_date") and t["id"] not in shown_ids]
     if stale_14:
         _send(f"📌 Other tasks open 14+ days ({len(stale_14)}):")
         # Cap to a reasonable number to avoid spam

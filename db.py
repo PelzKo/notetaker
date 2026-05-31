@@ -35,8 +35,7 @@ def init_db():
                     notion_synced_at DATETIME NULL DEFAULT NULL,
                     recurrence VARCHAR(40) NULL DEFAULT NULL,
                     remind_at DATETIME NULL DEFAULT NULL,
-                    remind_sent BOOLEAN NOT NULL DEFAULT FALSE,
-                    source_event_id VARCHAR(255) NULL DEFAULT NULL
+                    remind_sent BOOLEAN NOT NULL DEFAULT FALSE
                 ) CHARACTER SET utf8mb4
             """)
             # Migrate existing installations
@@ -47,8 +46,7 @@ def init_db():
                     ADD COLUMN IF NOT EXISTS is_priority BOOLEAN NOT NULL DEFAULT FALSE,
                     ADD COLUMN IF NOT EXISTS recurrence VARCHAR(40) NULL DEFAULT NULL,
                     ADD COLUMN IF NOT EXISTS remind_at DATETIME NULL DEFAULT NULL,
-                    ADD COLUMN IF NOT EXISTS remind_sent BOOLEAN NOT NULL DEFAULT FALSE,
-                    ADD COLUMN IF NOT EXISTS source_event_id VARCHAR(255) NULL DEFAULT NULL
+                    ADD COLUMN IF NOT EXISTS remind_sent BOOLEAN NOT NULL DEFAULT FALSE
             """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS attachments (
@@ -70,16 +68,15 @@ def init_db():
 def add_task(raw_text: str, title: str, category: str, due_date: date | None,
              is_priority: bool = False,
              recurrence: str | None = None,
-             remind_at: datetime | None = None,
-             source_event_id: str | None = None) -> int:
+             remind_at: datetime | None = None) -> int:
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO tasks (raw_text, title, category, due_date, is_priority, "
-                "recurrence, remind_at, source_event_id) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                "recurrence, remind_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
                 (raw_text, title, category, due_date, bool(is_priority),
-                 recurrence, remind_at, source_event_id),
+                 recurrence, remind_at),
             )
             return conn.insert_id()
 
@@ -90,7 +87,7 @@ def _select_open_tasks_sql(extra_where: str = "", order: str | None = None) -> s
         SELECT t.id, t.title, t.category, t.due_date, t.created_at,
                t.is_priority, t.is_done, t.done_at, t.raw_text,
                t.notion_page_id, t.notion_synced_at,
-               t.recurrence, t.remind_at, t.remind_sent, t.source_event_id,
+               t.recurrence, t.remind_at, t.remind_sent,
                COALESCE(a.cnt, 0) AS attachment_count
         FROM tasks t
         LEFT JOIN (
@@ -273,15 +270,6 @@ def mark_reminder_sent(task_id: int) -> bool:
             )
             return cur.rowcount > 0
 
-
-def get_task_by_event_id(event_id: str) -> dict | None:
-    with _conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, title, due_date, is_done FROM tasks WHERE source_event_id = %s LIMIT 1",
-                (event_id,),
-            )
-            return cur.fetchone()
 
 
 def get_open_tasks_due_today() -> list[dict]:

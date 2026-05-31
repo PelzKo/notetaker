@@ -255,15 +255,10 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     due_date = date.fromisoformat(due_date_str) if due_date_str else None
     is_priority = bool(parsed.get("is_priority", False))
     parse_error = parsed.get("error")
-    recurrence = parsed.get("recurrence")
-    remind_at_str = parsed.get("remind_at")
-    remind_at = datetime.strptime(remind_at_str, "%Y-%m-%d %H:%M") if remind_at_str else None
 
     task_id = db.add_task(
         raw, title, category, due_date,
         is_priority=is_priority,
-        recurrence=recurrence,
-        remind_at=remind_at,
     )
     _sync_task_to_notion(task_id)
 
@@ -507,16 +502,12 @@ async def handle_edit_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Re-parsing…")
     parsed = claude_client.parse_task(text)
     due_date = date.fromisoformat(parsed["due_date"]) if parsed.get("due_date") else None
-    remind_at_str = parsed.get("remind_at")
-    remind_at = datetime.strptime(remind_at_str, "%Y-%m-%d %H:%M") if remind_at_str else None
     db.update_task(
         task_id,
         title=parsed["title"],
         category=parsed["category"],
         due_date=due_date,
         is_priority=bool(parsed.get("is_priority", False)),
-        recurrence=parsed.get("recurrence"),
-        remind_at=remind_at,
     )
     _sync_task_to_notion(task_id)
 
@@ -620,6 +611,77 @@ async def cmd_snooze(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"💤 Snoozed #{task_id} until {new_remind.strftime('%a %d %b %H:%M')}."
     )
+
+
+_RECURRENCE_RE = re.compile(
+    r"^(daily|weekday|weekly:(mon|tue|wed|thu|fri|sat|sun)|monthly:(?:[1-9]|[12][0-9]|3[01]))$"
+)
+
+
+async def cmd_remind(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+    args = ctx.args or []
+    if len(args) < 2 or not args[0].isdigit():
+        await update.message.reply_text(
+            "Usage: /remind <task_id> <YYYY-MM-DD HH:MM|off>\n"
+            "Example: /remind 42 2026-06-01 09:00\n"
+            "         /remind 42 off"
+        )
+        return
+    task_id = int(args[0])
+    spec = " ".join(args[1:]).strip().lower()
+    task = db.get_task(task_id)
+    if not task:
+        await update.message.reply_text(f"Task #{task_id} not found.")
+        return
+    if spec == "off":
+        db.update_task(task_id, remind_at=None, remind_sent=False)
+        await update.message.reply_text(f"⏰ Reminder cleared for #{task_id}.")
+        return
+    try:
+        remind_at = datetime.strptime(spec, "%Y-%m-%d %H:%M")
+    except ValueError:
+        await update.message.reply_text(
+            "Couldn't parse datetime. Use: YYYY-MM-DD HH:MM (e.g. 2026-06-01 09:00)"
+        )
+        return
+    db.update_task(task_id, remind_at=remind_at, remind_sent=False)
+    await update.message.reply_text(
+        f"⏰ Reminder set for #{task_id}: {remind_at.strftime('%a %d %b %H:%M')}."
+    )
+
+
+async def cmd_repeat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+    args = ctx.args or []
+    if len(args) < 2 or not args[0].isdigit():
+        await update.message.reply_text(
+            "Usage: /repeat <task_id> <pattern|off>\n"
+            "Patterns: daily · weekday · weekly:mon · monthly:15\n"
+            "Example: /repeat 42 weekly:mon\n"
+            "         /repeat 42 off"
+        )
+        return
+    task_id = int(args[0])
+    pattern = args[1].strip().lower()
+    task = db.get_task(task_id)
+    if not task:
+        await update.message.reply_text(f"Task #{task_id} not found.")
+        return
+    if pattern == "off":
+        db.update_task(task_id, recurrence=None)
+        await update.message.reply_text(f"🔁 Recurrence cleared for #{task_id}.")
+        return
+    if not _RECURRENCE_RE.match(pattern):
+        await update.message.reply_text(
+            "Invalid pattern. Allowed: daily · weekday · weekly:<mon|tue|wed|thu|fri|sat|sun> · monthly:<1-31>"
+        )
+        return
+    db.update_task(task_id, recurrence=pattern)
+    _sync_task_to_notion(task_id)
+    await update.message.reply_text(f"🔁 #{task_id} repeats: {pattern}.")
 
 
 def _currently_in_meeting(events: dict) -> dict | None:
@@ -919,6 +981,8 @@ HELP_TEXT = (
     "/edit <id> <field> <value> — set title|category|date|priority\n"
     "/defer <id> [days] — push due date back (default 1)\n"
     "/priority <id> [on|off] — toggle ⭐\n"
+    "/remind <id> <YYYY-MM-DD HH:MM|off> — set or clear reminder\n"
+    "/repeat <id> <daily|weekday|weekly:mon|monthly:15|off> — set or clear recurrence\n"
     "/snooze <id> <1h|30m|tomorrow|mon> — push reminder forward\n"
     "/next — suggest what to do right now\n"
     "/drop <id> — delete\n\n"
@@ -1033,13 +1097,9 @@ def _create_task_for_caption(caption: str | None) -> tuple[int, str | None, str]
         due_str = parsed.get("due_date")
         due_date = date.fromisoformat(due_str) if due_str else None
         is_priority = bool(parsed.get("is_priority", False))
-        remind_at_str = parsed.get("remind_at")
-        remind_at = datetime.strptime(remind_at_str, "%Y-%m-%d %H:%M") if remind_at_str else None
         task_id = db.add_task(
             raw, title, category, due_date,
             is_priority=is_priority,
-            recurrence=parsed.get("recurrence"),
-            remind_at=remind_at,
         )
         return task_id, parsed.get("error"), raw
     task_id = db.add_task("📎 (attachment)", "📎 Untitled attachment", "Unknown", None, is_priority=False)
@@ -1051,16 +1111,12 @@ def _update_task_from_caption(task_id: int, caption: str) -> str | None:
     parsed = claude_client.parse_task(caption.strip())
     due_str = parsed.get("due_date")
     due_date = date.fromisoformat(due_str) if due_str else None
-    remind_at_str = parsed.get("remind_at")
-    remind_at = datetime.strptime(remind_at_str, "%Y-%m-%d %H:%M") if remind_at_str else None
     db.update_task(
         task_id,
         title=parsed["title"],
         category=parsed["category"],
         due_date=due_date,
         is_priority=bool(parsed.get("is_priority", False)),
-        recurrence=parsed.get("recurrence"),
-        remind_at=remind_at,
     )
     return parsed.get("error")
 
@@ -1396,6 +1452,8 @@ async def _post_init(app):
         BotCommand("edit", "Edit a task"),
         BotCommand("defer", "Push due date later"),
         BotCommand("priority", "Toggle ⭐ priority"),
+        BotCommand("remind", "Set or clear a reminder"),
+        BotCommand("repeat", "Set or clear recurrence"),
         BotCommand("snooze", "Snooze a reminder"),
         BotCommand("next", "Suggest what to do right now"),
         BotCommand("drop", "Delete a task"),
@@ -1435,6 +1493,8 @@ def main():
     app.add_handler(CommandHandler("show", cmd_show))
     app.add_handler(CommandHandler("defer", cmd_defer))
     app.add_handler(CommandHandler("priority", cmd_priority))
+    app.add_handler(CommandHandler("remind", cmd_remind))
+    app.add_handler(CommandHandler("repeat", cmd_repeat))
     app.add_handler(CommandHandler("snooze", cmd_snooze))
     app.add_handler(CommandHandler("next", cmd_next))
     app.add_handler(CallbackQueryHandler(handle_callback))
