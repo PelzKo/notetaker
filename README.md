@@ -8,15 +8,18 @@
 | /show &lt;id&gt; | Show full task detail and re-send any attachments |
 | /search &lt;query&gt; | Find open tasks whose title or original text contains the query |
 | /filter [category] | Filter open tasks by category (no arg → category picker buttons) |
-| /history [days] | List tasks completed in the last N days (default 7), grouped by date |
-| /done | Show numbered open task list; reply with IDs to mark done |
+| /history [7d\|date] | List tasks completed in the last N days (default 7d) or since a date, grouped by date |
+| /done [id ...] | Mark the given IDs done directly (`/done 42 43`); no IDs → numbered list, reply with IDs |
 | /edit &lt;id&gt; | Bot asks what to change (free-text re-parse mode) |
+| /edit &lt;id&gt; &lt;field&gt; | Bot shows the expected format and takes your next message as the new value (`/cancel` aborts) |
 | /edit &lt;id&gt; &lt;field&gt; &lt;value&gt; | Set a single field: `title`, `category`, `date`/`due`, `priority` |
-| /defer &lt;id&gt; [days] | Push the due date later by N days (default 1) |
+| /defer &lt;id&gt; [3d\|date] | Push the due date later by N days (default `1d`), or set it to a date |
 | /priority &lt;id&gt; [on\|off] | Toggle ⭐ priority (no arg → toggle) |
-| /snooze &lt;id&gt; &lt;1h\|30m\|tomorrow\|mon&gt; | Push a reminder forward |
+| /remind &lt;id&gt; &lt;when\|off&gt; | Set a reminder: `tomorrow 9:00`, `15.10. 14:30`, `2h`, `14:00`, … |
+| /repeat &lt;id&gt; &lt;pattern\|off&gt; | `daily`, `weekday`, `weekly:mon`, `monthly:15`, `every 2 weeks` / `2w`, `every 3 months` / `3m`, `10d` |
+| /snooze &lt;id&gt; &lt;1h\|30m\|tomorrow\|mon\|date&gt; | Push a reminder forward |
 | /next | Suggest one task to do right now (skips if you're in a meeting) |
-| /drop &lt;id&gt; | Delete a task permanently |
+| /drop &lt;id ...&gt; | Delete one or more tasks (↩️ Undo button restores them) |
 | /stats | Quick counts per category (open and done) |
 | /sync | Pull any Notion changes into MariaDB on demand |
 | /pushnotion [all] | Push every DB task missing a Notion page to Notion (open only by default) |
@@ -24,11 +27,18 @@
 | /help | Print every command grouped by purpose |
 | /cancel | Abort an in-progress /edit |
 
+**Dates** (everywhere a date or number of days is accepted): `3d`/`+3d`, `DD.MM.YYYY`, `DD.MM.` (this year), `YYYY-MM-DD`, `today`, `tomorrow`, `next month`. A bare number like `3` is rejected — write `3d`.
+
+**Categories** are case-insensitive and accept a unique prefix (`mcm`, `pers`).
+
+Long replies are split into several messages (≤3500 chars each) at section/line boundaries, marked "… (continued ⬇️)".
+
 ### Adding tasks
 
-- Send any text to add a task — Claude parses it into title, category, due date, ⭐ priority, recurrence, and an optional reminder time.
-- "every Monday", "jeden Dienstag", "monthly on the 15th", "every weekday", "daily" all create recurring tasks. When marked done, the next instance is auto-scheduled.
-- "remind me at 3pm to call mum" or "tomorrow at 9 dentist" sets a one-shot reminder fired by the per-minute reminder cron.
+- Send any text to add a task — Claude parses it into title, category, due date and ⭐ priority.
+- Recurrence and reminders are **not** detected from free text; set them explicitly on an existing task:
+  - `/repeat <id> <pattern>` — `daily`, `weekday`, `weekly:mon`, `monthly:15`, `every 2 weeks` (`2w`), `every 3 months` (`3m`), `every 10 days` (`10d`). `every:…` counts from the task's last due date. When a recurring task is marked done, the next instance is created automatically. `/repeat <id> off` stops it.
+  - `/remind <id> <when>` — one-shot reminder sent by the per-minute reminder cron. `<when>` can be `2h`, `30m`, `14:00`, `tomorrow 9:00`, `15.10. 14:30`, `2026-10-15 09:00`, or just a date (reminds at 08:00). `/remind <id> off` clears it; `/snooze` pushes it forward.
 - Pasting a URL by itself fetches the page title and uses it as the task name; the original URL is kept in `raw_text`.
 - Forwarded messages are treated as captured items.
 - Urgency keywords ("urgent", "asap", "wichtig", "dringend") set priority to true.
@@ -38,7 +48,8 @@
 
 ### Inline buttons
 
-- Every freshly captured task comes with **⭐ Priority / 📅 Today / 📅 Tomorrow / ➕1d / ✏️ /edit / ❌ Drop** buttons.
+- Every freshly captured task comes with **⭐ Priority / 📅 Today / 📅 Tomorrow / ➕1d / ✏️ Title / ❌ Drop** buttons. ✏️ Title asks for a new title (no re-parse).
+- `/show` cards have **✏️ Title / 📅 Date / 📂 Category** buttons.
 - After `/done`, an **↩️ Undo** button lets you re-open the most recently completed tasks.
 - New tasks parsed as `Unknown` come with quick-pick category buttons.
 - `/filter` with no argument shows a one-tap category picker.

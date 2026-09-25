@@ -12,12 +12,14 @@ import google_calendar
 import notion
 import interesting_reads
 from formatting import fmt_task_line
+from parsing import split_message
 
 
 def send_message(text: str):
     url = f"https://api.telegram.org/bot{config.TELEGRAM_TOKEN}/sendMessage"
-    resp = httpx.post(url, json={"chat_id": config.TELEGRAM_CHAT_ID, "text": text}, timeout=15)
-    resp.raise_for_status()
+    for chunk in split_message(text):
+        resp = httpx.post(url, json={"chat_id": config.TELEGRAM_CHAT_ID, "text": chunk}, timeout=15)
+        resp.raise_for_status()
 
 
 def build_summary() -> str:

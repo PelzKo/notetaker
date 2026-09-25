@@ -1,6 +1,8 @@
 import asyncio
 import logging
+import os
 import re
+import traceback
 from datetime import date, datetime, timedelta
 
 from telegram import (
@@ -26,6 +28,18 @@ import claude_client
 import notion
 import url_capture
 import google_calendar
+from parsing import (
+    CLEAR_WORDS,
+    DATE_FORMATS_HELP,
+    DATETIME_FORMATS_HELP,
+    RECURRENCE_HELP,
+    match_category,
+    normalize_recurrence,
+    parse_date,
+    parse_datetime,
+    parse_days,
+    split_message,
+)
 from formatting import (
     CATEGORY_EMOJI,
     build_task_list,
@@ -47,6 +61,34 @@ EDIT_TTL = timedelta(minutes=10)
 
 def _split_ids(s: str) -> list[str]:
     return [p for p in re.split(r"[\s,]+", s.strip()) if p]
+
+
+def _parse_id_args(args: list[str]) -> list[int] | None:
+    """'/drop 3 4,5' → [3, 4, 5]. None if empty or any part isn't a number."""
+    parts = _split_ids(" ".join(args))
+    if not parts or not all(p.isdigit() for p in parts):
+        return None
+    return list(dict.fromkeys(int(p) for p in parts))
+
+
+async def _reply_long(message, text: str, reply_markup=None) -> None:
+    """reply_text that splits over Telegram's length limit; markup goes on the last chunk."""
+    chunks = split_message(text)
+    for i, chunk in enumerate(chunks):
+        await message.reply_text(chunk, reply_markup=reply_markup if i == len(chunks) - 1 else None)
+
+
+async def _edit_long(query, text: str, reply_markup=None) -> None:
+    """Edit a callback's message with the first chunk, send the rest as new messages."""
+    chunks = split_message(text)
+    first_markup = reply_markup if len(chunks) == 1 else None
+    try:
+        await query.edit_message_text(chunks[0], reply_markup=first_markup)
+    except Exception as e:  # noqa: BLE001
+        log.warning("edit_message_text failed: %s", e)
+        await query.message.reply_text(chunks[0], reply_markup=first_markup)
+    for i, chunk in enumerate(chunks[1:], 1):
+        await query.message.reply_text(chunk, reply_markup=reply_markup if i == len(chunks) - 1 else None)
 
 # ---------------------------------------------------------------------------
 # Auth guard — only respond to your own chat
@@ -85,10 +127,12 @@ def _archive_task_in_notion(page_id: str | None) -> None:
 # Inline keyboard helpers
 # ---------------------------------------------------------------------------
 
-def _edit_button(task_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(f"✏️ /edit {task_id}", callback_data=f"edit:{task_id}")]]
-    )
+def _edit_buttons(task_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✏️ Title", callback_data=f"editf:{task_id}:title"),
+        InlineKeyboardButton("📅 Date", callback_data=f"editf:{task_id}:date"),
+        InlineKeyboardButton("📂 Category", callback_data=f"editf:{task_id}:category"),
+    ]])
 
 
 def _category_picker_rows(task_id: int) -> list[list[InlineKeyboardButton]]:
@@ -115,7 +159,7 @@ def _capture_action_rows(task_id: int, *, is_priority: bool = False) -> list[lis
         ],
         [
             InlineKeyboardButton("➕1d", callback_data=f"act:{task_id}:defer1"),
-            InlineKeyboardButton(f"✏️ /edit {task_id}", callback_data=f"edit:{task_id}"),
+            InlineKeyboardButton("✏️ Title", callback_data=f"editf:{task_id}:title"),
             InlineKeyboardButton("❌ Drop", callback_data=f"act:{task_id}:drop"),
         ],
     ]
@@ -123,7 +167,7 @@ def _capture_action_rows(task_id: int, *, is_priority: bool = False) -> list[lis
 
 def _category_picker_markup(task_id: int) -> InlineKeyboardMarkup:
     rows = _category_picker_rows(task_id)
-    rows.append([InlineKeyboardButton(f"✏️ /edit {task_id}", callback_data=f"edit:{task_id}")])
+    rows.append([InlineKeyboardButton("✏️ Title", callback_data=f"editf:{task_id}:title")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -134,28 +178,11 @@ def _undo_markup(task_ids: list[int]) -> InlineKeyboardMarkup:
     ]])
 
 
-# ---------------------------------------------------------------------------
-# Date keyword parsing for field-targeted /edit
-# ---------------------------------------------------------------------------
-
-def _parse_date_keyword(s: str) -> tuple[bool, date | None]:
-    """Return (ok, value). value=None means clear the date."""
-    s = s.strip().lower()
-    if s in ("none", "clear", "null", "off", "-"):
-        return True, None
-    if s == "today":
-        return True, date.today()
-    if s == "tomorrow":
-        return True, date.today() + timedelta(days=1)
-    if s.startswith("+") and s.endswith("d"):
-        try:
-            return True, date.today() + timedelta(days=int(s[1:-1]))
-        except ValueError:
-            return False, None
-    try:
-        return True, date.fromisoformat(s)
-    except ValueError:
-        return False, None
+def _undrop_markup(task_ids: list[int]) -> InlineKeyboardMarkup:
+    csv = ",".join(str(i) for i in task_ids)
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("↩️ Undo", callback_data=f"undrop:{csv}")
+    ]])
 
 
 # ---------------------------------------------------------------------------
@@ -280,25 +307,33 @@ async def _handle_done_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tex
         )
         return
 
-    session_ids = {t["id"]: t for t in session}
+    session_ids = {t["id"] for t in session}
     ids = [int(x) for x in _split_ids(text) if x.isdigit()]
+    ctx.user_data["task_list"] = []  # clear session
+    await _mark_done_ids(update.message, ids, allowed=session_ids)
+
+
+async def _mark_done_ids(message, ids: list[int], *, allowed: set[int] | None = None):
+    """Mark tasks done and reply with a summary + undo button.
+    If `allowed` is given, IDs outside it are rejected as 'not in list'."""
     marked: list[tuple[int, str]] = []  # (task_id, title)
     failed: list[str] = []
     for task_id in ids:
-        if task_id in session_ids:
-            task = session_ids[task_id]
-            transitioned, new_id = db.mark_done_ex(task["id"])
-            if transitioned:
-                marked.append((task["id"], task["title"]))
-                _sync_task_to_notion(task["id"])
-                if new_id is not None:
-                    _sync_task_to_notion(new_id)
-            else:
-                failed.append(task["title"])
-        else:
+        if allowed is not None and task_id not in allowed:
             failed.append(f"#{task_id} (not in list)")
-
-    ctx.user_data["task_list"] = []  # clear session
+            continue
+        task = db.get_task(task_id)
+        if not task:
+            failed.append(f"#{task_id} (not found)")
+            continue
+        transitioned, new_id = db.mark_done_ex(task_id)
+        if transitioned:
+            marked.append((task_id, task["title"]))
+            _sync_task_to_notion(task_id)
+            if new_id is not None:
+                _sync_task_to_notion(new_id)
+        else:
+            failed.append(f"{task['title']} (already done)")
 
     lines = []
     if marked:
@@ -308,7 +343,7 @@ async def _handle_done_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tex
     text_out = "\n\n".join(lines) or "Nothing changed."
 
     reply_markup = _undo_markup([tid for tid, _ in marked]) if marked else None
-    await update.message.reply_text(text_out, reply_markup=reply_markup)
+    await _reply_long(message, text_out, reply_markup=reply_markup)
 
 
 # ---------------------------------------------------------------------------
@@ -323,13 +358,13 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tasks = db.get_open_tasks()
     if only_text:
         ctx.user_data["task_list"] = []  # no numbered done flow
-        await update.message.reply_text(build_task_list_simple(tasks))
+        await _reply_long(update.message, build_task_list_simple(tasks))
         return
     ctx.user_data["task_list"] = tasks
     msg = build_task_list_sectioned(tasks)
     if tasks:
         msg += "\n\nReply with task IDs to mark done."
-    await update.message.reply_text(msg)
+    await _reply_long(update.message, msg)
 
 
 async def cmd_listtext(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -337,7 +372,7 @@ async def cmd_listtext(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     tasks = db.get_open_tasks()
     ctx.user_data["task_list"] = []
-    await update.message.reply_text(build_task_list_simple(tasks))
+    await _reply_long(update.message, build_task_list_simple(tasks))
 
 
 # ---------------------------------------------------------------------------
@@ -347,42 +382,91 @@ async def cmd_listtext(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
+    args = ctx.args or []
+    if args:
+        ids = _parse_id_args(args)
+        if ids is None:
+            await update.message.reply_text("Usage: /done [task_id ...]  e.g. /done 42 43")
+            return
+        await _mark_done_ids(update.message, ids)
+        return
     tasks = db.get_open_tasks()
     if not tasks:
         await update.message.reply_text("✅ No open tasks.")
         return
     ctx.user_data["task_list"] = tasks
     msg = build_task_list_sectioned(tasks, "Which tasks are done? Reply with task IDs:")
-    await update.message.reply_text(msg)
+    await _reply_long(update.message, msg)
 
 
 # ---------------------------------------------------------------------------
-# /drop <id>
+# /drop <id ...>
 # ---------------------------------------------------------------------------
+
+_DROPPED_MAX = 50  # how many deleted-task snapshots to keep for undo
+
+
+def _drop_task(ctx: ContextTypes.DEFAULT_TYPE, task: dict) -> None:
+    """Delete a task, keeping a snapshot in user_data so it can be undone."""
+    dropped: dict = ctx.user_data.setdefault("dropped", {})
+    dropped[task["id"]] = (task, db.get_attachments(task["id"]))
+    while len(dropped) > _DROPPED_MAX:
+        dropped.pop(next(iter(dropped)))
+    db.delete_task(task["id"])
+    _archive_task_in_notion(task.get("notion_page_id"))
+
 
 async def cmd_drop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
-    args = ctx.args
-    if not args or not args[0].isdigit():
-        await update.message.reply_text("Usage: /drop <task_id>")
+    ids = _parse_id_args(ctx.args or [])
+    if ids is None:
+        await update.message.reply_text("Usage: /drop <task_id ...>  e.g. /drop 42 43")
         return
-    task_id = int(args[0])
-    task = db.get_task(task_id)
-    if not task:
-        await update.message.reply_text(f"Task #{task_id} not found.")
-        return
-    page_id = task.get("notion_page_id")
-    db.delete_task(task_id)
-    _archive_task_in_notion(page_id)
-    await update.message.reply_text(f"🗑 Deleted: {task['title']}")
+    deleted: list[tuple[int, str]] = []
+    missing: list[int] = []
+    for task_id in ids:
+        task = db.get_task(task_id)
+        if not task:
+            missing.append(task_id)
+            continue
+        _drop_task(ctx, task)
+        deleted.append((task_id, task["title"]))
+    lines = []
+    if deleted:
+        lines.append("🗑 Deleted:\n" + "\n".join(f"  • #{tid} {t}" for tid, t in deleted))
+    if missing:
+        lines.append("⚠️ Not found: " + ", ".join(f"#{i}" for i in missing))
+    markup = _undrop_markup([tid for tid, _ in deleted]) if deleted else None
+    await _reply_long(update.message, "\n\n".join(lines), reply_markup=markup)
 
 
 # ---------------------------------------------------------------------------
 # /edit <id> [field value]
 # ---------------------------------------------------------------------------
 
-EDIT_WAITING: dict[int, tuple[int, datetime]] = {}  # chat_id → (task_id, started_at)
+# chat_id → (task_id, field, started_at); field=None means full re-parse mode
+EDIT_WAITING: dict[int, tuple[int, str | None, datetime]] = {}
+
+_PRIORITY_ON = ("on", "true", "1", "yes", "y")
+_PRIORITY_OFF = ("off", "false", "0", "no", "n")
+
+
+def _normalize_field(field: str) -> str:
+    return "date" if field == "due" else field
+
+
+def _updated_text(task: dict) -> str:
+    emoji = CATEGORY_EMOJI.get(task["category"], "📌")
+    lines = [
+        f"✅ Updated #{task['id']}:",
+        f"📌 {task['title']}",
+        f"{emoji} {task['category']}",
+    ]
+    if task.get("is_priority"):
+        lines.append("⭐ priority")
+    lines.append(f"📅 {fmt_date(task['due_date'])}")
+    return "\n".join(lines)
 
 
 async def _start_edit(chat_id: int, task_id: int, reply_fn) -> None:
@@ -390,7 +474,7 @@ async def _start_edit(chat_id: int, task_id: int, reply_fn) -> None:
     if not task:
         await reply_fn(f"Task #{task_id} not found.")
         return
-    EDIT_WAITING[chat_id] = (task_id, datetime.now())
+    EDIT_WAITING[chat_id] = (task_id, None, datetime.now())
     emoji = CATEGORY_EMOJI.get(task["category"], "📌")
     await reply_fn(
         f"Editing #{task_id}: {task['title']}\n"
@@ -401,54 +485,89 @@ async def _start_edit(chat_id: int, task_id: int, reply_fn) -> None:
     )
 
 
-async def _edit_field(update: Update, task_id: int, field: str, value: str):
+async def _start_field_edit(chat_id: int, task_id: int, field: str, reply_fn) -> None:
+    """Ask for a new value of one field; the next text message is taken as that value."""
+    field = _normalize_field(field)
+    task = db.get_task(task_id)
+    if not task:
+        await reply_fn(f"Task #{task_id} not found.")
+        return
+    EDIT_WAITING[chat_id] = (task_id, field, datetime.now())
+    markup = None
+    header = f"Editing #{task_id}: {task['title']}\n\n"
+    if field == "title":
+        body = "Send the new title."
+    elif field == "date":
+        body = (f"Current due date: {fmt_date(task['due_date'])}\n"
+                "Send the new due date, or 'none' to clear it.\n\n" + DATE_FORMATS_HELP)
+    elif field == "category":
+        emoji = CATEGORY_EMOJI.get(task["category"], "📌")
+        body = (f"Current category: {emoji} {task['category']}\n"
+                "Tap a category or send its name (case doesn't matter, a prefix like 'pers' works): "
+                + ", ".join(config.CATEGORIES))
+        markup = InlineKeyboardMarkup(_category_picker_rows(task_id))
+    else:  # priority
+        body = f"Priority is {'on ⭐' if task.get('is_priority') else 'off'}. Send 'on' or 'off'."
+    await reply_fn(header + body + "\n\n/cancel to abort.", reply_markup=markup)
+
+
+async def _edit_field(update: Update, task_id: int, field: str, value: str,
+                      *, retry_hint: bool = False) -> bool:
+    """Apply a single-field edit. Returns False if the value was invalid."""
+    field = _normalize_field(field)
+    retry = "\n\nSend another value, or /cancel." if retry_hint else ""
     task = db.get_task(task_id)
     if not task:
         await update.message.reply_text(f"Task #{task_id} not found.")
-        return
+        return True  # nothing left to retry
 
+    value = value.strip()
     if field == "title":
-        if not value.strip():
-            await update.message.reply_text("Need a title value.")
-            return
-        db.update_task(task_id, title=value.strip()[:500])
+        if not value:
+            await update.message.reply_text("Need a title value." + retry)
+            return False
+        db.update_task(task_id, title=value[:500])
     elif field == "category":
-        if value not in config.CATEGORIES:
+        cat = match_category(value)
+        if cat is None:
             await update.message.reply_text(
-                "Unknown category. Pick one of: " + ", ".join(config.CATEGORIES)
+                "Unknown category. Pick one of: " + ", ".join(config.CATEGORIES) + retry
             )
-            return
-        db.update_task(task_id, category=value)
-    elif field in ("date", "due"):
-        ok, d = _parse_date_keyword(value)
-        if not ok:
-            await update.message.reply_text(
-                "Couldn't parse date. Use YYYY-MM-DD, today, tomorrow, +Nd, or none."
-            )
-            return
+            return False
+        db.update_task(task_id, category=cat)
+    elif field == "date":
+        if value.lower() in CLEAR_WORDS:
+            d = None
+        else:
+            d = parse_date(value)
+            if d is None:
+                await update.message.reply_text(
+                    f"Couldn't parse date '{value}'.\n\n{DATE_FORMATS_HELP}\n• none — clear the date" + retry
+                )
+                return False
         db.update_task(task_id, due_date=d)
     elif field == "priority":
-        v = value.strip().lower()
-        if v in ("on", "true", "1", "yes", "y"):
+        v = value.lower()
+        if v in _PRIORITY_ON:
             db.update_task(task_id, is_priority=True)
-        elif v in ("off", "false", "0", "no", "n"):
+        elif v in _PRIORITY_OFF:
             db.update_task(task_id, is_priority=False)
         else:
-            await update.message.reply_text("Use: /edit <id> priority on|off")
-            return
+            await update.message.reply_text("Use: on or off" + retry)
+            return False
 
     _sync_task_to_notion(task_id)
-    new_task = db.get_task(task_id)
-    emoji = CATEGORY_EMOJI.get(new_task["category"], "📌")
-    lines = [
-        f"✅ Updated #{task_id}:",
-        f"📌 {new_task['title']}",
-        f"{emoji} {new_task['category']}",
-    ]
-    if new_task.get("is_priority"):
-        lines.append("⭐ priority")
-    lines.append(f"📅 {fmt_date(new_task['due_date'])}")
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text(_updated_text(db.get_task(task_id)))
+    return True
+
+
+EDIT_USAGE = (
+    "Usage:\n"
+    "/edit <id> — re-parse the task from new text\n"
+    "/edit <id> <field> — I'll ask for the new value\n"
+    "/edit <id> <field> <value> — set it directly\n"
+    "Fields: title, date, category, priority"
+)
 
 
 async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -456,14 +575,20 @@ async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     args = ctx.args or []
     if not args or not args[0].isdigit():
-        await update.message.reply_text(
-            "Usage: /edit <task_id> [field value]\n"
-            "Fields: title, category, date, priority"
-        )
+        await update.message.reply_text(EDIT_USAGE)
         return
     task_id = int(args[0])
-    if len(args) >= 2 and args[1].lower() in EDIT_FIELDS:
-        await _edit_field(update, task_id, args[1].lower(), " ".join(args[2:]))
+    if len(args) >= 2:
+        field = args[1].lower()
+        if field not in EDIT_FIELDS:
+            await update.message.reply_text(f"Unknown field '{args[1]}'.\n\n{EDIT_USAGE}")
+            return
+        value = " ".join(args[2:])
+        if value.strip():
+            await _edit_field(update, task_id, field, value)
+        else:
+            await _start_field_edit(update.effective_chat.id, task_id, field,
+                                    update.message.reply_text)
         return
     await _start_edit(
         update.effective_chat.id,
@@ -475,7 +600,9 @@ async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
-    EDIT_WAITING.pop(update.effective_chat.id, None)
+    if EDIT_WAITING.pop(update.effective_chat.id, None) is None:
+        await update.message.reply_text("Nothing to cancel.")
+        return
     await update.message.reply_text("Cancelled.")
 
 
@@ -484,7 +611,7 @@ async def handle_edit_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     entry = EDIT_WAITING.get(chat_id)
     if entry is None:
         return False
-    task_id, started = entry
+    task_id, field, started = entry
     if datetime.now() - started > EDIT_TTL:
         EDIT_WAITING.pop(chat_id, None)
         await update.message.reply_text("⏱️ Edit session expired. Please run /edit again.")
@@ -493,10 +620,17 @@ async def handle_edit_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
 
-    if text in config.CATEGORIES:
-        db.update_task(task_id, category=text)
+    if field is not None:
+        ok = await _edit_field(update, task_id, field, text, retry_hint=True)
+        if not ok:
+            EDIT_WAITING[chat_id] = (task_id, field, datetime.now())  # keep waiting
+        return True
+
+    cat = match_category(text)
+    if cat is not None:
+        db.update_task(task_id, category=cat)
         _sync_task_to_notion(task_id)
-        await update.message.reply_text(f"✅ Category updated to {text}.")
+        await update.message.reply_text(f"✅ Category updated to {cat}.")
         return True
 
     await update.message.reply_text("⏳ Re-parsing…")
@@ -510,23 +644,12 @@ async def handle_edit_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         is_priority=bool(parsed.get("is_priority", False)),
     )
     _sync_task_to_notion(task_id)
-
-    new_task = db.get_task(task_id)
-    emoji = CATEGORY_EMOJI.get(new_task["category"], "📌")
-    lines = [
-        f"✅ Updated #{task_id}:",
-        f"📌 {new_task['title']}",
-        f"{emoji} {new_task['category']}",
-    ]
-    if new_task.get("is_priority"):
-        lines.append("⭐ priority")
-    lines.append(f"📅 {fmt_date(new_task['due_date'])}")
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text(_updated_text(db.get_task(task_id)))
     return True
 
 
 # ---------------------------------------------------------------------------
-# /defer <id> [days]
+# /defer <id> [days|date]
 # ---------------------------------------------------------------------------
 
 async def cmd_defer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -534,17 +657,26 @@ async def cmd_defer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     args = ctx.args or []
     if not args or not args[0].isdigit():
-        await update.message.reply_text("Usage: /defer <task_id> [days]")
+        await update.message.reply_text(
+            "Usage: /defer <task_id> [3d|date] (default 1d)\n"
+            "3d pushes the current due date back 3 days; a date sets it directly.\n\n"
+            + DATE_FORMATS_HELP
+        )
         return
     task_id = int(args[0])
-    days = 1
-    if len(args) >= 2:
-        try:
-            days = int(args[1])
-        except ValueError:
-            await update.message.reply_text("Days must be an integer.")
+    spec = " ".join(args[1:]) or "1d"
+    days = parse_days(spec)
+    if days is not None:
+        new_due = db.defer_task(task_id, days)
+    else:
+        new_due = parse_date(spec)
+        if new_due is None:
+            await update.message.reply_text(f"Couldn't parse '{spec}'.\n\n{DATE_FORMATS_HELP}")
             return
-    new_due = db.defer_task(task_id, days)
+        if db.get_task(task_id) is not None:
+            db.update_task(task_id, due_date=new_due)
+        else:
+            new_due = None
     if new_due is None:
         await update.message.reply_text(f"Task #{task_id} not found.")
         return
@@ -563,28 +695,13 @@ def _parse_snooze_duration(spec: str) -> datetime | None:
     s = spec.strip().lower()
     if not s:
         return None
-    now = datetime.now()
-    # 1h, 2h, 30m, 90m
-    if s.endswith("h"):
-        try:
-            return now + timedelta(hours=int(s[:-1]))
-        except ValueError:
-            return None
-    if s.endswith("m"):
-        try:
-            return now + timedelta(minutes=int(s[:-1]))
-        except ValueError:
-            return None
-    if s == "tomorrow":
-        return datetime.combine(date.today() + timedelta(days=1),
-                                datetime.min.time().replace(hour=8))
     if s in _SNOOZE_WEEKDAYS:
         target = _SNOOZE_WEEKDAYS.index(s)
         d = date.today() + timedelta(days=1)
         while d.weekday() != target:
             d += timedelta(days=1)
         return datetime.combine(d, datetime.min.time().replace(hour=8))
-    return None
+    return parse_datetime(s)
 
 
 async def cmd_snooze(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -593,14 +710,15 @@ async def cmd_snooze(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = ctx.args or []
     if len(args) < 2 or not args[0].isdigit():
         await update.message.reply_text(
-            "Usage: /snooze <task_id> <1h|30m|tomorrow|mon|tue|...>"
+            "Usage: /snooze <task_id> <1h|30m|tomorrow|mon|tue|...|date [HH:MM]>"
         )
         return
     task_id = int(args[0])
-    new_remind = _parse_snooze_duration(args[1])
+    new_remind = _parse_snooze_duration(" ".join(args[1:]))
     if new_remind is None:
         await update.message.reply_text(
-            "Couldn't parse duration. Try: 1h, 30m, tomorrow, mon, fri."
+            "Couldn't parse duration. Also accepted: mon, tue, … (next weekday, 08:00)\n\n"
+            + DATETIME_FORMATS_HELP
         )
         return
     task = db.get_task(task_id)
@@ -613,20 +731,15 @@ async def cmd_snooze(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-_RECURRENCE_RE = re.compile(
-    r"^(daily|weekday|weekly:(mon|tue|wed|thu|fri|sat|sun)|monthly:(?:[1-9]|[12][0-9]|3[01]))$"
-)
-
-
 async def cmd_remind(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
     args = ctx.args or []
     if len(args) < 2 or not args[0].isdigit():
         await update.message.reply_text(
-            "Usage: /remind <task_id> <YYYY-MM-DD HH:MM|off>\n"
-            "Example: /remind 42 2026-06-01 09:00\n"
-            "         /remind 42 off"
+            "Usage: /remind <task_id> <when|off>\n"
+            "Examples: /remind 42 tomorrow 9:00 · /remind 42 15.10. 14:30 · "
+            "/remind 42 2h · /remind 42 off\n\n" + DATETIME_FORMATS_HELP
         )
         return
     task_id = int(args[0])
@@ -639,11 +752,13 @@ async def cmd_remind(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         db.update_task(task_id, remind_at=None, remind_sent=False)
         await update.message.reply_text(f"⏰ Reminder cleared for #{task_id}.")
         return
-    try:
-        remind_at = datetime.strptime(spec, "%Y-%m-%d %H:%M")
-    except ValueError:
+    remind_at = parse_datetime(spec)
+    if remind_at is None:
+        await update.message.reply_text(f"Couldn't parse '{spec}'.\n\n{DATETIME_FORMATS_HELP}")
+        return
+    if remind_at <= datetime.now():
         await update.message.reply_text(
-            "Couldn't parse datetime. Use: YYYY-MM-DD HH:MM (e.g. 2026-06-01 09:00)"
+            f"⚠️ {remind_at.strftime('%a %d %b %H:%M')} is in the past — pick a future time."
         )
         return
     db.update_task(task_id, remind_at=remind_at, remind_sent=False)
@@ -659,25 +774,24 @@ async def cmd_repeat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(args) < 2 or not args[0].isdigit():
         await update.message.reply_text(
             "Usage: /repeat <task_id> <pattern|off>\n"
-            "Patterns: daily · weekday · weekly:mon · monthly:15\n"
-            "Example: /repeat 42 weekly:mon\n"
-            "         /repeat 42 off"
+            "Example: /repeat 42 weekly:mon · /repeat 42 every 2 weeks · /repeat 42 off\n\n"
+            + RECURRENCE_HELP
         )
         return
     task_id = int(args[0])
-    pattern = args[1].strip().lower()
+    raw_pattern = " ".join(args[1:]).strip()
     task = db.get_task(task_id)
     if not task:
         await update.message.reply_text(f"Task #{task_id} not found.")
         return
-    if pattern == "off":
+    if raw_pattern.lower() == "off":
         db.update_task(task_id, recurrence=None)
+        _sync_task_to_notion(task_id)
         await update.message.reply_text(f"🔁 Recurrence cleared for #{task_id}.")
         return
-    if not _RECURRENCE_RE.match(pattern):
-        await update.message.reply_text(
-            "Invalid pattern. Allowed: daily · weekday · weekly:<mon|tue|wed|thu|fri|sat|sun> · monthly:<1-31>"
-        )
+    pattern = normalize_recurrence(raw_pattern)
+    if pattern is None:
+        await update.message.reply_text(f"Invalid pattern '{raw_pattern}'.\n\n{RECURRENCE_HELP}")
         return
     db.update_task(task_id, recurrence=pattern)
     _sync_task_to_notion(task_id)
@@ -813,7 +927,7 @@ async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     msg = build_task_list(results, header=f"🔍 Search results for '{q}':")
     msg += "\n\nReply with task IDs to mark done."
-    await update.message.reply_text(msg)
+    await _reply_long(update.message, msg)
 
 
 # ---------------------------------------------------------------------------
@@ -824,15 +938,20 @@ async def cmd_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
     args = ctx.args or []
-    if args and args[0] in config.CATEGORIES:
-        cat = args[0]
+    cat = match_category(" ".join(args)) if args else None
+    if args and cat is None:
+        await update.message.reply_text(
+            f"Unknown category '{' '.join(args)}'. Pick one of: " + ", ".join(config.CATEGORIES)
+        )
+        return
+    if cat:
         results = db.get_tasks_by_category(cat)
         ctx.user_data["task_list"] = results
         emoji = CATEGORY_EMOJI.get(cat, "📌")
         msg = build_task_list(results, header=f"📂 {emoji} {cat}:")
         if results:
             msg += "\n\nReply with task IDs to mark done."
-        await update.message.reply_text(msg)
+        await _reply_long(update.message, msg)
         return
 
     cats = [c for c in config.CATEGORIES if c != "Unknown"]
@@ -864,10 +983,19 @@ async def cmd_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
-    args = ctx.args or []
+    spec = " ".join(ctx.args or []).strip()
     days = 7
-    if args and args[0].isdigit():
-        days = int(args[0])
+    if spec:
+        days = parse_days(spec)
+        if days is None:
+            since = parse_date(spec)
+            if since is None or since > date.today():
+                await update.message.reply_text(
+                    "Usage: /history [7d|date] — last N days, or everything since a past date.\n\n"
+                    + DATE_FORMATS_HELP
+                )
+                return
+            days = (date.today() - since).days + 1
     rows = db.get_done_tasks(days)
     if not rows:
         await update.message.reply_text(f"No completed tasks in the last {days} day(s).")
@@ -901,7 +1029,7 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             star = "⭐ " if t.get("is_priority") else ""
             lines.append(f"  ✅ {star}{emoji} {t['title']} — {t['category']}")
         lines.append("")
-    await update.message.reply_text("\n".join(lines).rstrip())
+    await _reply_long(update.message, "\n".join(lines).rstrip())
 
 
 # ---------------------------------------------------------------------------
@@ -920,7 +1048,7 @@ async def cmd_show(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not task:
         await update.message.reply_text(f"Task #{task_id} not found.")
         return
-    await update.message.reply_text(fmt_task_detail(task), reply_markup=_edit_button(task_id))
+    await _reply_long(update.message, fmt_task_detail(task), reply_markup=_edit_buttons(task_id))
 
     chat_id = update.effective_chat.id
     for att in db.get_attachments(task_id):
@@ -976,29 +1104,32 @@ HELP_TEXT = (
     "/history [days] — recently completed (default 7d)\n"
     "/stats — counts per category\n\n"
     "Modifying\n"
-    "/done — mark tasks done by ID\n"
+    "/done [id ...] — mark done (no IDs: pick from list)\n"
     "/edit <id> — re-parse from new text\n"
+    "/edit <id> <field> — I'll ask for the new value\n"
     "/edit <id> <field> <value> — set title|category|date|priority\n"
-    "/defer <id> [days] — push due date back (default 1)\n"
+    "/defer <id> [3d|date] — push due date back (default 1d) or set it\n"
     "/priority <id> [on|off] — toggle ⭐\n"
-    "/remind <id> <YYYY-MM-DD HH:MM|off> — set or clear reminder\n"
-    "/repeat <id> <daily|weekday|weekly:mon|monthly:15|off> — set or clear recurrence\n"
-    "/snooze <id> <1h|30m|tomorrow|mon> — push reminder forward\n"
+    "/remind <id> <when|off> — e.g. tomorrow 9:00, 15.10. 14:30, 2h\n"
+    "/repeat <id> <pattern|off> — daily, weekday, weekly:mon, monthly:15, every 2 weeks, every 3 months\n"
+    "/snooze <id> <1h|30m|tomorrow|mon|date> — push reminder forward\n"
     "/next — suggest what to do right now\n"
-    "/drop <id> — delete\n\n"
+    "/drop <id ...> — delete (with undo)\n\n"
+    "Dates: 3d, 15.10.2026, 15.10., 2026-10-15, today, tomorrow, next month\n"
+    "Categories are case-insensitive; a prefix like 'pers' works.\n\n"
     "Notion\n"
     "/sync — pull changes from Notion\n"
     "/pushnotion — push DB tasks to Notion\n\n"
     "Misc\n"
     "/menu — show keyboard\n"
-    "/cancel — abort an /edit"
+    "/cancel — abort a pending /edit"
 )
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
-    await update.message.reply_text(HELP_TEXT)
+    await _reply_long(update.message, HELP_TEXT)
 
 
 # ---------------------------------------------------------------------------
@@ -1034,8 +1165,8 @@ async def cmd_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔄 Pulling changes from Notion…")
     changes = notion.sync_from_notion()
     if changes:
-        await update.message.reply_text(
-            "✅ Synced from Notion:\n" + "\n".join(f"• {c}" for c in changes)
+        await _reply_long(
+            update.message, "✅ Synced from Notion:\n" + "\n".join(f"• {c}" for c in changes)
         )
     else:
         await update.message.reply_text("✅ Nothing to sync — Notion is up to date.")
@@ -1236,8 +1367,21 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = query.data or ""
 
     # Any non-edit button press cancels a pending /edit waiting on this chat.
-    if not data.startswith("edit:"):
+    if not data.startswith(("edit:", "editf:")):
         EDIT_WAITING.pop(query.message.chat.id, None)
+
+    if data.startswith("editf:"):
+        _, raw_id, field = data.split(":", 2)
+        if field not in EDIT_FIELDS:
+            await query.message.reply_text(f"Unknown field: {field}")
+            return
+        await _start_field_edit(
+            query.message.chat.id,
+            int(raw_id),
+            field,
+            query.message.reply_text,
+        )
+        return
 
     if data.startswith("edit:"):
         task_id = int(data.split(":", 1)[1])
@@ -1281,15 +1425,14 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         if action == "drop":
-            page_id = task.get("notion_page_id")
-            db.delete_task(task_id)
-            _archive_task_in_notion(page_id)
+            _drop_task(ctx, task)
             text = f"🗑 Deleted #{task_id}: {task['title']}"
+            markup = _undrop_markup([task_id])
             try:
-                await query.edit_message_text(text)
+                await query.edit_message_text(text, reply_markup=markup)
             except Exception as e:  # noqa: BLE001
                 log.warning("edit_message_text (act:drop) failed: %s", e)
-                await query.message.reply_text(text)
+                await query.message.reply_text(text, reply_markup=markup)
             return
 
         if action == "done":
@@ -1374,6 +1517,30 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(text)
         return
 
+    if data.startswith("undrop:"):
+        ids = [int(x) for x in data.split(":", 1)[1].split(",") if x.strip().isdigit()]
+        dropped: dict = ctx.user_data.get("dropped", {})
+        restored: list[str] = []
+        failed: list[str] = []
+        for tid in ids:
+            snap = dropped.pop(tid, None)
+            if snap is None:
+                failed.append(f"#{tid} (no longer in memory)")
+                continue
+            task, attachments = snap
+            if db.restore_task(task, attachments):
+                _sync_task_to_notion(tid)
+                restored.append(f"#{tid} {task['title']}")
+            else:
+                failed.append(f"#{tid} (ID already in use)")
+        lines = []
+        if restored:
+            lines.append("↩️ Restored:\n" + "\n".join(f"  • {t}" for t in restored))
+        if failed:
+            lines.append("⚠️ Couldn't restore:\n" + "\n".join(f"  • {t}" for t in failed))
+        await _edit_long(query, "\n\n".join(lines) or "Nothing to undo.")
+        return
+
     if data.startswith("nextagain:"):
         prev = int(data.split(":", 1)[1])
         excluded = set(ctx.user_data.get("next_excluded", set()))
@@ -1414,11 +1581,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         msg = build_task_list(results, header=f"📂 {emoji} {cat}:")
         if results:
             msg += "\n\nReply with task IDs to mark done."
-        try:
-            await query.edit_message_text(msg)
-        except Exception as e:  # noqa: BLE001
-            log.warning("edit_message_text (filter) failed: %s", e)
-            await query.message.reply_text(msg)
+        await _edit_long(query, msg)
         return
 
 
@@ -1434,6 +1597,48 @@ async def text_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if handled:
             return
     await handle_text(update, ctx)
+
+
+# ---------------------------------------------------------------------------
+# Fallbacks: unknown commands and unhandled errors
+# ---------------------------------------------------------------------------
+
+async def cmd_unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+    cmd = (update.message.text or "").split()[0]
+    await update.message.reply_text(f"Unknown command {cmd}. Type /help for the full list.")
+
+
+def _error_location(err: BaseException) -> str | None:
+    """'bot.py:123 in cmd_edit' for the innermost traceback frame inside this project."""
+    project_dir = os.path.dirname(os.path.abspath(__file__))
+    frames = [f for f in traceback.extract_tb(err.__traceback__)
+              if os.path.abspath(f.filename).startswith(project_dir + os.sep)
+              and f"{os.sep}venv{os.sep}" not in os.path.abspath(f.filename)]
+    if not frames:
+        return None
+    f = frames[-1]
+    return f"{os.path.basename(f.filename)}:{f.lineno} in {f.name}"
+
+
+async def _on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+    err = ctx.error
+    log.error("Unhandled error while processing update", exc_info=err)
+    lines = ["⚠️ Something went wrong.", "", f"Error: {type(err).__name__}: {str(err)[:1500] or '(no message)'}"]
+    where = _error_location(err)
+    if where:
+        lines.append(f"Where: {where}")
+    if isinstance(update, Update):
+        if update.message and update.message.text:
+            lines.append(f"While handling: {update.message.text[:200]}")
+        elif update.callback_query:
+            lines.append(f"While handling button: {update.callback_query.data}")
+    lines += ["", "Please try again."]
+    try:
+        await ctx.bot.send_message(config.TELEGRAM_CHAT_ID, "\n".join(lines))
+    except Exception as e:  # noqa: BLE001
+        log.warning("Failed to send error notice: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -1456,13 +1661,13 @@ async def _post_init(app):
         BotCommand("repeat", "Set or clear recurrence"),
         BotCommand("snooze", "Snooze a reminder"),
         BotCommand("next", "Suggest what to do right now"),
-        BotCommand("drop", "Delete a task"),
+        BotCommand("drop", "Delete task(s)"),
         BotCommand("stats", "Counts per category"),
         BotCommand("sync", "Pull from Notion"),
         BotCommand("pushnotion", "Push tasks to Notion"),
         BotCommand("menu", "Show keyboard menu"),
         BotCommand("help", "Show all commands"),
-        BotCommand("cancel", "Cancel /edit"),
+        BotCommand("cancel", "Cancel a pending /edit"),
     ])
 
 
@@ -1501,6 +1706,8 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+    app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
+    app.add_error_handler(_on_error)
 
     log.info("Bot starting…")
     app.run_polling(drop_pending_updates=True)

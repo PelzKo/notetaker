@@ -2,6 +2,8 @@ import pymysql
 import config
 from datetime import date, datetime, timedelta
 
+from parsing import add_months
+
 
 def _conn():
     return pymysql.connect(
@@ -161,7 +163,8 @@ _WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
 def compute_next_due(recurrence: str, base: date) -> date | None:
     """Given a recurrence string and a base date, return the next due date (after base).
-    Recognized formats: 'daily', 'weekday', 'weekly:<mon|tue|...>', 'monthly:<1-31>'.
+    Recognized formats: 'daily', 'weekday', 'weekly:<mon|tue|...>', 'monthly:<1-31>',
+    'every:<N><d|w|m>' (every N days/weeks/months, counted from base).
     Returns None if the string can't be parsed."""
     rec = (recurrence or "").strip().lower()
     if not rec:
@@ -195,6 +198,21 @@ def compute_next_due(recurrence: str, base: date) -> date | None:
             if d.day == day:
                 return d
             d += timedelta(days=1)
+        return None
+    if rec.startswith("every:"):
+        spec = rec.split(":", 1)[1].strip()
+        try:
+            n, unit = int(spec[:-1]), spec[-1]
+        except (ValueError, IndexError):
+            return None
+        if n < 1:
+            return None
+        if unit == "d":
+            return base + timedelta(days=n)
+        if unit == "w":
+            return base + timedelta(weeks=n)
+        if unit == "m":
+            return add_months(base, n)
         return None
     return None
 
@@ -322,6 +340,34 @@ def delete_task(task_id: int) -> bool:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM tasks WHERE id = %s", (task_id,))
             return cur.rowcount > 0
+
+
+_RESTORE_COLUMNS = ("id", "raw_text", "title", "category", "due_date", "created_at",
+                    "done_at", "is_done", "is_priority", "recurrence", "remind_at",
+                    "remind_sent")
+
+
+def restore_task(task: dict, attachments: list[dict]) -> bool:
+    """Re-insert a previously deleted task under its original ID, with attachments.
+    The Notion link is not restored (the old page was archived)."""
+    cols = [c for c in _RESTORE_COLUMNS if c in task]
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM tasks WHERE id = %s", (task["id"],))
+            if cur.fetchone():
+                return False
+            cur.execute(
+                f"INSERT INTO tasks ({', '.join(cols)}) VALUES ({', '.join(['%s'] * len(cols))})",
+                tuple(task[c] for c in cols),
+            )
+            for a in attachments:
+                cur.execute(
+                    "INSERT INTO attachments (task_id, file_id, file_unique_id, kind, "
+                    "file_name, mime_type, caption, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (task["id"], a["file_id"], a["file_unique_id"], a["kind"],
+                     a.get("file_name"), a.get("mime_type"), a.get("caption"), a.get("created_at")),
+                )
+    return True
 
 
 def get_task(task_id: int) -> dict | None:

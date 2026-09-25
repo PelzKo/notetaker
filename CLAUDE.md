@@ -44,13 +44,14 @@ The bot is single-process, long-polling. All modules import `config` at startup 
 | `notion.py` | Notion REST API calls; `enabled()` guards all operations when credentials are absent |
 | `google_calendar.py` | OAuth2 token-based Google Calendar reads |
 | `formatting.py` | Pure formatting helpers and `CATEGORY_EMOJI` dict |
+| `parsing.py` | Pure input helpers: `parse_date`/`parse_datetime` (all date formats + help strings), `match_category`, `normalize_recurrence`, `split_message` (Telegram length limit) |
 | `scheduler.py` | Run by cron; calls `notion.sync_from_notion()` then sends daily summary via raw Telegram HTTP |
 | `keepalive.sh` | Cron script that restarts `bot.py` if it's not running |
 
 ### Key data flow
 
 1. User sends text → `bot.py:text_router` → `claude_client.parse_task()` → `db.add_task()` → `notion.create_page()` (if configured)
-2. `/edit` uses in-memory `EDIT_WAITING` dict (chat_id → task_id) to track pending edits across messages
+2. `/edit` uses in-memory `EDIT_WAITING` dict (chat_id → (task_id, field|None, started_at)) to track pending edits across messages; `field=None` = full re-parse, otherwise the next message is the new value for that field
 3. `/list` and `/done` store the current task list in `ctx.user_data["task_list"]` so numbered replies can be resolved to task IDs
 4. `scheduler.py` runs standalone (no bot process), sends messages via raw HTTP POST to the Telegram sendMessage endpoint
 

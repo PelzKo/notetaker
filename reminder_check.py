@@ -9,15 +9,18 @@ import httpx
 import config
 import db
 from formatting import CATEGORY_EMOJI, fmt_date
+from parsing import split_message
 
 
 def _send(text: str, reply_markup: dict | None = None) -> None:
-    payload: dict = {"chat_id": config.TELEGRAM_CHAT_ID, "text": text}
-    if reply_markup is not None:
-        payload["reply_markup"] = reply_markup
     url = f"https://api.telegram.org/bot{config.TELEGRAM_TOKEN}/sendMessage"
-    resp = httpx.post(url, json=payload, timeout=15)
-    resp.raise_for_status()
+    chunks = split_message(text)
+    for i, chunk in enumerate(chunks):
+        payload: dict = {"chat_id": config.TELEGRAM_CHAT_ID, "text": chunk}
+        if reply_markup is not None and i == len(chunks) - 1:
+            payload["reply_markup"] = reply_markup
+        resp = httpx.post(url, json=payload, timeout=15)
+        resp.raise_for_status()
 
 
 def _reminder_keyboard(task_id: int) -> dict:
